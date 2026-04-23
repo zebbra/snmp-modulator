@@ -1185,7 +1185,7 @@ class Modulator:
                 auth_changed=auth_changed,
                 polling_interval=new_interval,
                 polling_timeout=new_timeout,
-                scrape_site=site,
+                scrape_site=site_label,
                 scrape_site_changed=site_changed,
             )
 
