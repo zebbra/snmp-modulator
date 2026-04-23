@@ -446,13 +446,20 @@ class SnmpExporterClient:
         """
         url = f"{self._base_url}/snmp"
         params = {"target": target, "module": canary_module, "auth": auth}
+        logger.debug("probe_auth GET %s params=%s", url, params)
         try:
             resp = self._session.get(url, params=params, timeout=self._timeout)
-            resp.raise_for_status()
-            metrics = self._parse(resp.text)
-            return metrics.get("up", 0.0) == 1.0
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            logger.debug("probe_auth %r: request failed: %s", auth, exc)
             return False
+        if resp.status_code != 200:
+            body = resp.text.strip().splitlines()[0] if resp.text else ""
+            logger.debug("probe_auth %r: HTTP %d — %s", auth, resp.status_code, body[:200])
+            return False
+        metrics = self._parse(resp.text)
+        up = metrics.get("up", 0.0)
+        logger.debug("probe_auth %r: up=%s  metrics=%d", auth, up, len(metrics))
+        return up == 1.0
 
     @staticmethod
     def _parse(text: str) -> dict:

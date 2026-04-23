@@ -13,9 +13,9 @@ auth:
   policy:       use        # use | try | drop — fallback when no rule has auth: section; rule-level auth.try overrides this
   probe_module: system
 
-scrape_sites:           # set to ~ to disable entirely; modulator always probes via SNMP_EXPORTER_URL
-  field:   snmp_scrape_site   # NetBox choice field — written back so scrapers can filter by it
-  default: default            # label written when no rule matches
+# scrape_sites:           # set to ~ to disable entirely; modulator always probes via SNMP_EXPORTER_URL
+#   field:   snmp_scrape_site   # NetBox choice field — written back so scrapers can filter by it
+#   default: default            # label written when no rule matches
 
 defaults:
   modules:
