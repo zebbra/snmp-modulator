@@ -1,0 +1,51 @@
+services:
+  modulator:
+    build:
+      context: .
+      args:
+        - http_proxy
+        - https_proxy
+        - no_proxy
+    env_file:
+      - .env
+    volumes:
+      - ./mapping.yaml:/app/mapping.yaml:ro
+    restart: unless-stopped
+    networks:
+      - traefik
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: traefik
+      # HTTP → HTTPS redirect
+      traefik.http.routers.modulator-http-router.entrypoints: http
+      traefik.http.routers.modulator-http-router.rule: Host(`${MODULATOR_HOSTNAME}`) && PathPrefix(`/probe`, `/metrics`, `/health`, `/docs`, `/openapi.json`)
+      traefik.http.routers.modulator-http-router.middlewares: modulator-redirect
+      traefik.http.middlewares.modulator-redirect.redirectscheme.scheme: https
+      # HTTPS
+      traefik.http.routers.modulator-https-router.entrypoints: https
+      traefik.http.routers.modulator-https-router.tls: "true"
+      traefik.http.routers.modulator-https-router.rule: Host(`${MODULATOR_HOSTNAME}`) && PathPrefix(`/probe`, `/metrics`, `/health`, `/docs`, `/openapi.json`)
+      traefik.http.services.modulator-service.loadbalancer.server.port: "8081"
+      traefik.http.services.modulator-service.loadbalancer.server.scheme: http
+
+  # One-shot CLI probe — override entrypoint:
+  #   docker compose run --rm cli --host 10.0.0.1 --dry-run
+  #   docker compose run --rm cli --netbox-filter "role=switch&site=dc1" --dry-run
+  cli:
+    build:
+      context: .
+      args:
+        - http_proxy
+        - https_proxy
+        - no_proxy
+    env_file:
+      - .env
+    volumes:
+      - ./mapping.yaml:/app/mapping.yaml:ro
+    entrypoint: ["python", "cli.py"]
+    profiles:
+      - cli
+
+networks:
+  traefik:
+    external: true

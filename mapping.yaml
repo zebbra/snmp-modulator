@@ -1,0 +1,366 @@
+# snmp-modulator mapping — see README.md for full reference
+
+modules:
+  field:            snmp_exporter_module
+  policy:           drop      # use | try | drop
+  interval_field:   snmp_polling_interval   # omit or leave empty to measure only, never write
+  timeout_field:    snmp_polling_timeout    # omit or leave empty to measure only, never write
+  default_interval: 3m        # baseline — only write if calculated value is higher
+  default_timeout:  2m
+
+auth:
+  field:        snmp_auth_profile
+  policy:       use        # use | try | drop — fallback when no rule has auth: section; rule-level auth.try overrides this
+  probe_module: system
+
+scrape_sites:           # set to ~ to disable entirely; modulator always probes via SNMP_EXPORTER_URL
+  field:   snmp_scrape_site   # NetBox choice field — written back so scrapers can filter by it
+  default: default            # label written when no rule matches
+
+defaults:
+  modules:
+    add: []
+    try:
+      - system
+      - if_full
+    block: []
+  auth:
+    try: []
+
+rules:
+
+  # ── Cisco ────────────────────────────────────────────────────────────────────
+  - name: "Cisco generic"
+    match:
+      device_type.manufacturer.slug: "cisco"
+    modules:
+      try:
+        - cisco_generic
+        - cisco_sensor
+        - cisco_envmon
+        - cisco_memory_pool
+
+  - name: "Cisco legacy slow devices"
+    match:
+      device_type.manufacturer.slug: "cisco"
+      device_type.slug: "IE-2000-8TC-G-E|WS-C3650-.*|WS-C3560(CX|E|X)-.*|WS-C2960(C|CPD|CX|S)?-.*|WS-C3750(G|X)-.*|CC?897VA.*"
+    modules:
+      try:
+        - if_errors
+        - if_status
+        - if_traffic
+        - cisco_memory_pool
+        - cisco_nac        
+      block:
+        - if_full
+
+  - name: "Cisco mid-old-access"
+    match:
+      device_type.manufacturer.slug: "cisco"
+      device_type.slug: "WS-C2960X.*|WS-C3850.*"
+    modules:
+      try:
+        - cisco_process
+        - cisco_stackwise
+        - cisco_rf
+        - if_full
+        - cisco_memory_pool
+        - cisco_nac
+  - name: "Cisco old access"
+    match:
+      device_type.manufacturer.slug: "cisco"
+      device_type.slug: "WS-C2960[^X].*"
+    modules:
+      try: 
+        - cisco_memory_pool
+        - cisco_nac
+
+  - name: "Cisco new-access (C9200, C9300)"
+    match:
+      device_type.manufacturer.slug: "cisco"
+      device_type.slug: "C9[23][05]0.*"
+    modules:
+      add:
+        - if_full
+      try:
+        - cisco_generic
+        - cisco_sensor
+        - cisco_envmon
+        - cisco_process
+        - cisco_stackwise
+        - cisco_rf
+        - cisco_nac
+      block: 
+        - cisco_memory_pool   
+
+  - name: "Cisco distribution (C9500, C9600, C6800)"
+    match:
+      device_type.manufacturer.slug: "cisco"
+      device_type.slug: "C9[56]\\d\\d.*|C68\\d\\d.*"
+    modules:
+      add:
+        - if_full
+      block:
+        - cisco_stackwise
+        - cisco_memory_pool
+      try:
+        - cisco_generic
+        - cisco_sensor
+        - cisco_envmon
+        - cisco_process
+        - cisco_virtual_switch
+        - cisco_rf
+
+  - name: "Cisco NX-OS"
+    match:
+      device_type.manufacturer.slug: "cisco"
+      custom_fields.os_name: "NX-OS.*"
+    modules:
+      add:
+        - if_full
+      block:
+        - cisco_envmon
+        - cisco_stackwise
+        - cisco_virtual_switch
+        - cisco_rf
+      try:
+        - cisco_generic
+        - cisco_sensor
+        - cisco_process
+
+  - name: "Cisco WLC (C9800)"
+    match:
+      device_type.manufacturer.slug: "cisco"
+      device_type.slug: "C9800.*"
+    modules:
+      add:
+        - if_full
+      block:
+        - cisco_stackwise
+      try:
+        - cisco_generic
+        - cisco_sensor
+        - cisco_envmon
+        - cisco_process
+        - cisco_wlc
+        - cisco_rf
+
+  - name: "Cisco WLC (by hostname)"
+    match:
+      device_type.manufacturer.slug: "cisco"
+      name: ".*wlc.*"
+    modules:
+      add:
+        - if_full
+      block:
+        - cisco_stackwise
+      try:
+        - cisco_generic
+        - cisco_sensor
+        - cisco_envmon
+        - cisco_process
+        - cisco_wlc
+        - cisco_rf
+
+  - name: "Cisco routers"
+    match:
+      device_type.manufacturer.slug: "cisco"
+      role.slug: "router"
+    modules:
+      try:
+        - bgp
+        - cisco_ietf_bfd
+        - cisco_wan_cell
+        - cisco_rttmon
+
+  - name: "SD-WAN (service group)"
+    match:
+      custom_fields.service_group: "sdwan"
+    auth:
+      try:
+        - ETZ_SNMP_L3
+        - ETZ_SNMP_L2
+    modules:
+      try:
+        - bgp
+        - cisco_wan_cell
+        - cisco_rttmon
+
+  - name: "Cisco LWAPP APs — no SNMP"
+    match:
+      role.slug: "lwapp-ap"
+    auth:
+      use: ~
+    modules:
+      block:
+        - _ALL
+
+  # ── Fortinet ─────────────────────────────────────────────────────────────────
+  # Sub-type rules block fortinet_fortigate to enforce mutual exclusivity.
+
+  - name: "Fortinet FortiGate (default)"
+    match:
+      device_type.manufacturer.slug: "fortinet"
+    modules:
+      try:
+        - fortinet_fortigate
+
+  - name: "Fortinet FortiManager"
+    match:
+      device_type.manufacturer.slug: "fortinet"
+      custom_fields.snmp_auth_profile: ".*FortiManager.*"
+    modules:
+      block:
+        - fortinet_fortigate
+      try:
+        - fortinet_fortianalyzer
+
+  - name: "Fortinet FortiSandbox (by auth profile)"
+    match:
+      device_type.manufacturer.slug: "fortinet"
+      custom_fields.snmp_auth_profile: ".*FortiSandbox.*"
+    modules:
+      block:
+        - fortinet_fortigate
+      try:
+        - fortinet_fortisandbox
+
+  - name: "Fortinet FortiSandbox (by hostname)"
+    match:
+      device_type.manufacturer.slug: "fortinet"
+      name: ".*sand.*"
+    modules:
+      block:
+        - fortinet_fortigate
+      try:
+        - fortinet_fortisandbox
+
+  - name: "Fortinet FortiAuthenticator"
+    match:
+      device_type.manufacturer.slug: "fortinet"
+      name: ".*auth.*"
+    modules:
+      block:
+        - fortinet_fortigate
+      try:
+        - fortinet_fortiauthenticator
+
+  - name: "Fortinet FortiProxy"
+    match:
+      device_type.manufacturer.slug: "fortinet"
+      name: ".*proxy.*"
+    modules:
+      block:
+        - fortinet_fortigate
+      try:
+        - fortinet_fortiproxy
+
+  - name: "Fortinet FortiMail"
+    match:
+      device_type.manufacturer.slug: "fortinet"
+      name: ".*mail.*"
+    modules:
+      block:
+        - fortinet_fortigate
+      try:
+        - fortinet_fortimail
+  - name: "Fortinet FortiADC"
+    match:
+      device_type.manufacturer.slug: "fortinet"
+      device_type.slug: "fortiadc-.*"
+    modules:
+      block:
+        - fortinet_fortigate
+      try:
+        - fortinet_fortiadc
+
+  # ── Other vendors ─────────────────────────────────────────────────────────────
+
+  - name: "EfficientIP"
+    match:
+      device_type.manufacturer.slug: "efficientip"
+    modules:
+      add:
+        - if_full
+        - linux
+      try:
+        - udp
+        - efficientip
+
+  - name: "F5 BIG-IP"
+    match:
+      device_type.manufacturer.slug: "f5"
+    modules:
+      try:
+        - f5_bigip
+        - if_errors
+        - if_status
+        - if_traffic
+
+  - name: "Servers"
+    match:
+      role.slug: "server"
+    modules:
+      add:
+        - if_full
+      try:
+        - host_ressources
+
+  - name: "Windows-SNMP"
+    match:
+      platform.slug: "windows-server.*"
+    modules:
+      block:
+        - if_full
+      try:
+        - host_ressources
+        - if_full_legacy
+        - system
+
+  - name: "RunIP — no SNMP"
+    match:
+      device_type.manufacturer.slug: "runip"
+    modules:
+      block:
+        - _ALL
+
+# ── Last Resorts ─────────────────────────────────────────────────────────────
+
+  # - name: "Cisco — auth discovery"
+  #   match:
+  #     device_type.manufacturer.slug: "cisco"
+  #     custom_fields.snmp_auth_profile: ""
+  #   auth:
+  #     try:
+  #       - SNMPV3_L3
+  #       - SNMPV3_L2
+
+  # - name: "Fortinet — auth discovery"
+  #   match:
+  #     device_type.manufacturer.slug: "fortinet"
+  #     custom_fields.snmp_auth_profile: ""
+  #   auth:
+  #     try:
+  #       - SNMPV3_FORTINET
+
+  # Tag a device "discover" to trigger blind auth + module discovery.
+  # auth.try: _ALL overrides global auth_policy=use — probes every known auth profile.
+  # modules.try: _ALL probes every module known to snmp-exporter.
+  # On success: remove tags. On fail: add fixme-snmp for manual follow-up.
+  - name: "Last-resort discovery (tag-driven)"
+    match:
+      tags: "discover"
+    auth:
+      try:
+        - _ALL
+    modules:
+      try:
+        - _ALL
+    on_success:
+      remove_tag:
+      #   - discover
+        - fixme-snmp
+    on_fail:
+      add_tag:
+        - fixme-snmp
+
