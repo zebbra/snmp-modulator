@@ -458,8 +458,10 @@ class SnmpExporterClient:
             return False
         metrics = self._parse(resp.text)
         up = metrics.get("up", 0.0)
-        logger.debug("probe_auth %r: up=%s  metrics=%d", auth, up, len(metrics))
-        return up == 1.0
+        useful, useful_count, _ = self._evaluate(metrics)
+        logger.debug("probe_auth %r: up=%s  useful=%d  metrics=%d",
+                     auth, up, useful_count, len(metrics))
+        return up == 1.0 or useful
 
     @staticmethod
     def _parse(text: str) -> dict:
