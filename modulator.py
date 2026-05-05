@@ -804,6 +804,10 @@ class Callbacks:
         """result: resolved | failed | skipped (auth_policy=use or auth.use rule)"""
         pass
 
+    def module_changed(self, module: str, action: str) -> None:
+        """action: added | removed (per-module delta vs previous NetBox value)"""
+        pass
+
 
 # ── Modulator (orchestration) ─────────────────────────────────────────────────
 
@@ -1052,6 +1056,10 @@ class Modulator:
                 added   = sorted(set(final_modules) - set(previous_modules))
                 removed = sorted(set(previous_modules) - set(final_modules))
                 log.info("Modules changed — added=%s removed=%s", added, removed)
+                for m in added:
+                    callbacks.module_changed(module=m, action="added")
+                for m in removed:
+                    callbacks.module_changed(module=m, action="removed")
 
             # ── Polling calculation ───────────────────────────────────────────
             # Requires both NetBox choice sets to be available; otherwise skipped.

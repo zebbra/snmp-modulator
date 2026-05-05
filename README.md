@@ -402,6 +402,7 @@ modulator_devices_processed_total{result="success|error"}
 modulator_module_tests_total{module="<name>", result="useful|empty|error"}
 modulator_module_test_duration_seconds{module="<name>"}
 modulator_netbox_updates_total{action="changed|unchanged"}
+modulator_module_changes_total{module="<name>", action="added|removed"}
 modulator_auth_probe_results_total{result="resolved|failed|skipped"}
 modulator_probe_duration_seconds
 modulator_probe_in_progress

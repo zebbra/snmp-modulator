@@ -102,6 +102,12 @@ auth_probe_results_total = Counter(
     ["result"],   # resolved | failed | skipped
     **_reg,
 )
+module_changes_total = Counter(
+    "modulator_module_changes_total",
+    "Per-module assignment deltas written back to NetBox",
+    ["module", "action"],   # action: added | removed
+    **_reg,
+)
 probe_duration = Histogram(
     "modulator_probe_duration_seconds",
     "Total duration of a /probe or /probe/netbox call",
@@ -151,6 +157,9 @@ class _ServerCallbacks(Callbacks):
 
     def auth_probed(self, result: str) -> None:
         auth_probe_results_total.labels(result=result).inc()
+
+    def module_changed(self, module: str, action: str) -> None:
+        module_changes_total.labels(module=module, action=action).inc()
 
 
 # ── Config ────────────────────────────────────────────────────────────────────

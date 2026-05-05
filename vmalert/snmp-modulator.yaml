@@ -1,0 +1,83 @@
+groups:
+  # ── Inventory hygiene (info) ────────────────────────────────────────────────
+  # Long-running "find dead config" signals. Info severity — no urgency,
+  # but worth a periodic clean-up of snmp-exporter config and NetBox choice sets.
+  - name: snmp-modulator-housekeeping
+    interval: 5m
+    rules:
+      - alert: SnmpAuthProfileUnused
+        expr: max_over_time(modulator_netbox_devices_by_auth{profile!~"(?i).*test.*"}[90d]) == 0
+        for: 1h
+        labels:
+          severity: info
+          component: snmp-modulator
+        annotations:
+          summary: 'Auth profile "{{ $labels.profile }}" unused for 90+ days'
+          description: |
+            No NetBox device has been assigned SNMP auth profile "{{ $labels.profile }}"
+            in the last 90 days. Consider removing it from snmp-exporter /config and
+            from the NetBox snmp_auth_profile choice set.
+            (Profiles whose name matches /test/i are excluded from this alert.)
+
+      - alert: SnmpModuleUnused
+        expr: max_over_time(modulator_netbox_devices_by_module{module!~"(?i).*test.*"}[90d]) == 0
+        for: 1h
+        labels:
+          severity: info
+          component: snmp-modulator
+        annotations:
+          summary: 'snmp-exporter module "{{ $labels.module }}" unused for 90+ days'
+          description: |
+            No NetBox device has been assigned snmp-exporter module "{{ $labels.module }}"
+            in the last 30 days. Consider trimming it from the snmp-exporter modules.yml
+            and from the NetBox snmp_exporter_module choice set.
+
+  # ── Operational health (warning) ────────────────────────────────────────────
+  - name: snmp-modulator-health
+    interval: 1m
+    rules:
+      - alert: SnmpModulatorRefreshStalled
+        expr: increase(modulator_netbox_devices_refresh_duration_seconds_count[2h]) == 0
+        for: 30m
+        labels:
+          severity: warning
+          component: snmp-modulator
+        annotations:
+          summary: snmp-modulator NetBox device-count refresh has stalled
+          description: |
+            No NetBox device-count refresh has completed in the last 2 hours.
+            Expected cadence: every MODULATOR_NETBOX_REFRESH_INTERVAL seconds (default 600).
+            Likely causes: NetBox unreachable, refresher thread crashed, or snmp-exporter /config failing.
+
+      - alert: SnmpModulatorHighDeviceErrorRate
+        expr: |
+          sum(rate(modulator_devices_processed_total{result="error"}[15m]))
+          /
+          clamp_min(sum(rate(modulator_devices_processed_total[15m])), 0.001)
+          > 0.10
+        for: 15m
+        labels:
+          severity: warning
+          component: snmp-modulator
+        annotations:
+          summary: snmp-modulator device-processing error rate above 10%
+          description: |
+            More than 10% of devices processed in the last 15 minutes returned errors.
+            Check modulator logs and snmp-exporter availability.
+
+      - alert: SnmpModulatorAuthProbeFailing
+        expr: |
+          sum(rate(modulator_auth_probe_results_total{result="failed"}[1h]))
+          /
+          clamp_min(sum(rate(modulator_auth_probe_results_total[1h])), 0.001)
+          > 0.20
+        for: 30m
+        labels:
+          severity: warning
+          component: snmp-modulator
+        annotations:
+          summary: snmp-modulator auth-probe failure rate above 20%
+          description: |
+            Auth profile resolution is failing for >20% of devices over the last hour.
+            Possible causes: snmp-exporter unreachable, SNMP credentials rotated,
+            or NetBox auth profiles drifted from snmp-exporter /config.
