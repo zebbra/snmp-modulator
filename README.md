@@ -105,10 +105,9 @@ Each rule has `modules` and `auth`, mirroring the top-level structure:
       - if_mib           # veto — wins over add/try from any rule
       - _ALL             # nuclear veto — final list is empty regardless of other rules
   auth:
-    use: SNMPV3_CISCO    # unconditional — no probe, write back if different
-    use: ~               # clear the auth profile field
-    try:
-      - SNMPV3_L3        # probe in order; first returning up=1 wins
+    try:                 # probe in order; first returning up=1 wins
+      - SNMPV3_Foo       # try v3 first, works well when you are in a rolling v2-> v3 migration 
+      - SNMPV2_legacy    # fallback to snmpv2 if v3 doesn't answer
       - _ALL             # expand to every auth profile known to snmp-exporter (/config)
     probe_module: if_mib # canary module override for this rule's auth probing
 ```

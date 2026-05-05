@@ -234,7 +234,7 @@ def _refresh_device_counts() -> None:
     auth_ok = mod_ok = 0
     for profile in snmp.auths:
         try:
-            n = nb.nb.dcim.devices.filter(**{f"cf_{engine.auth_field}": profile}).count()
+            n = nb.nb.dcim.devices.count(**{f"cf_{engine.auth_field}": profile})
             netbox_devices_by_auth.labels(profile=profile).set(n)
             auth_ok += 1
         except Exception as exc:
@@ -242,7 +242,7 @@ def _refresh_device_counts() -> None:
 
     for module in snmp.modules:
         try:
-            n = nb.nb.dcim.devices.filter(**{f"cf_{engine.module_field}": module}).count()
+            n = nb.nb.dcim.devices.count(**{f"cf_{engine.module_field}": module})
             netbox_devices_by_module.labels(module=module).set(n)
             mod_ok += 1
         except Exception as exc:
