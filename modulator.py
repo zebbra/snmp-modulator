@@ -214,8 +214,24 @@ class NetboxClient:
 
         Returns list[DeviceInfo].  Devices without primary_ip4 or the configured
         auth field are logged and skipped.
+
+        Safety: NetBox silently ignores unknown filter params and returns the entire
+        fleet. If the caller passed any user filter and the count equals the
+        unfiltered total, refuse rather than probe everything by accident.
         """
         netbox_filter_kwargs.setdefault("has_primary_ip", True)
+
+        user_filters = {k: v for k, v in netbox_filter_kwargs.items() if k != "has_primary_ip"}
+        if user_filters:
+            filtered_count   = self.nb.dcim.devices.count(**netbox_filter_kwargs)
+            unfiltered_count = self.nb.dcim.devices.count(has_primary_ip=True)
+            if unfiltered_count > 1 and filtered_count == unfiltered_count:
+                logger.error(
+                    "NetBox filter %s matched all %d eligible devices — refusing "
+                    "(likely typo or unknown filter key)",
+                    user_filters, unfiltered_count,
+                )
+                return []
 
         devices = []
         for dev in self.nb.dcim.devices.filter(**netbox_filter_kwargs):

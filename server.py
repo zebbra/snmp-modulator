@@ -18,6 +18,7 @@ so any NetBox API filter is valid:
 
 import logging
 import os
+import re
 import threading
 import time
 from typing import Annotated, Optional
@@ -184,6 +185,10 @@ _MAPPING_FILE:  str  = os.getenv("MAPPING_FILE", "mapping.yaml")
 _MAX_CONCURRENT: int           = int(os.getenv("MODULATOR_MAX_CONCURRENT_RUNS", "1"))
 _DEVICE_PARALLELISM: int       = int(os.getenv("MODULATOR_DEVICE_PARALLELISM", "1"))
 _NETBOX_REFRESH_INTERVAL: int = int(os.getenv("MODULATOR_NETBOX_REFRESH_INTERVAL", "600"))
+
+# pynetbox filter keys: alphanumeric + underscore (allowing pynetbox's __operator suffix style).
+# Anything else (slashes, question marks, dots, etc.) is rejected before reaching NetBox.
+_VALID_FILTER_KEY = re.compile(r"^[a-zA-Z0-9_]+$")
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -374,6 +379,18 @@ async def probe_netbox(
     for k, v in request.query_params.multi_items():
         grouped.setdefault(k, []).append(v)
     filter_params = {k: v[0] if len(v) == 1 else v for k, v in grouped.items()}
+
+    # Reject obviously-malformed filter keys early — protects against pynetbox
+    # silently ignoring junk and returning the entire fleet.
+    bad = [k for k in filter_params if not _VALID_FILTER_KEY.match(k)]
+    if bad:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"invalid filter key(s) {bad!r} — keys must be alphanumeric/underscore "
+                f"with optional __operator (e.g. site_id, last_updated__lt)"
+            ),
+        )
 
     job_key = "netbox:" + "&".join(f"{k}={v}" for k, v in sorted(filter_params.items()))
 
