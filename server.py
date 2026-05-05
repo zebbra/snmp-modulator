@@ -182,6 +182,7 @@ _METRICS_PATH:   str           = os.getenv("MODULATOR_METRICS_PATH", "/metrics")
 _DRY_RUN:       bool = _flag("MODULATOR_DRY_RUN")
 _MAPPING_FILE:  str  = os.getenv("MAPPING_FILE", "mapping.yaml")
 _MAX_CONCURRENT: int           = int(os.getenv("MODULATOR_MAX_CONCURRENT_RUNS", "1"))
+_DEVICE_PARALLELISM: int       = int(os.getenv("MODULATOR_DEVICE_PARALLELISM", "1"))
 _NETBOX_REFRESH_INTERVAL: int = int(os.getenv("MODULATOR_NETBOX_REFRESH_INTERVAL", "600"))
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -287,7 +288,12 @@ def _run_probe(job_key: str, devices_fn) -> None:
     start = time.time()
     try:
         nb, snmp, engine, module_policy = _make_clients()
-        mod = Modulator(nb, snmp, engine, dry_run=_DRY_RUN, module_policy=module_policy)
+        mod = Modulator(
+            nb, snmp, engine,
+            dry_run=_DRY_RUN,
+            module_policy=module_policy,
+            device_parallelism=_DEVICE_PARALLELISM,
+        )
         devices = devices_fn(nb)
         mod.run(devices, callbacks=_ServerCallbacks())
     except Exception as exc:

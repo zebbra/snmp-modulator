@@ -66,11 +66,16 @@ from modulator import AUTH_POLICIES, MODULE_POLICIES, MappingEngine, Modulator, 
               default=False,
               envvar="MODULATOR_DRY_RUN",
               help="Log changes without writing to NetBox.")
+@click.option("--device-parallelism",
+              type=int,
+              default=1,
+              envvar="MODULATOR_DEVICE_PARALLELISM",
+              help="Number of devices probed concurrently within one run (1 = sequential).")
 @click.option("--debug",
               is_flag=True,
               default=False,
               help="Enable debug logging.")
-def main(host, netbox_filter, mapping, module_policy, auth_policy, module_field, auth_field, dry_run, debug):
+def main(host, netbox_filter, mapping, module_policy, auth_policy, module_field, auth_field, dry_run, device_parallelism, debug):
     """Run SNMP module modulation for matching NetBox devices."""
 
     logging.basicConfig(
@@ -121,7 +126,12 @@ def main(host, netbox_filter, mapping, module_policy, auth_policy, module_field,
         verify_tls=verify_tls,
         timeout=timeout,
     )
-    mod = Modulator(nb, snmp, engine, dry_run=dry_run, module_policy=resolved_module_policy)
+    mod = Modulator(
+        nb, snmp, engine,
+        dry_run=dry_run,
+        module_policy=resolved_module_policy,
+        device_parallelism=device_parallelism,
+    )
 
     if dry_run:
         log.info("DRY RUN mode — NetBox will not be updated")

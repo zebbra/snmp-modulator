@@ -345,7 +345,8 @@ Tag changes are batched with the module write when modules changed — one API c
 | `MODULATOR_AUTH_TOKEN` | unset | Bearer token for `/probe` endpoints (disabled if unset) |
 | `MODULATOR_PORT` | `8080` | Server listen port |
 | `MODULATOR_WORKERS` | `4` | uvicorn worker count |
-| `MODULATOR_MAX_CONCURRENT_RUNS` | `1` | Max simultaneous probe jobs |
+| `MODULATOR_MAX_CONCURRENT_RUNS` | `1` | Max simultaneous probe jobs (per worker) |
+| `MODULATOR_DEVICE_PARALLELISM` | `1` | Devices probed concurrently within a single run (1 = sequential). SNMP probing is I/O-bound, so 10–20 is usually a safe sweet spot |
 | `MODULATOR_NETBOX_REFRESH_INTERVAL` | `600` | Seconds between NetBox device-count gauge refreshes (set `0` to disable) |
 | `PROMETHEUS_MULTIPROC_DIR` | unset | Enable multiprocess Prometheus metrics (required when workers > 1) |
 | `MODULATOR_METRICS_PATH` | `/metrics` | Prometheus metrics endpoint path |
@@ -370,6 +371,7 @@ Options:
   --module-field TEXT       Override mapping.yaml netbox_fields.module_field
   --auth-field TEXT         Override mapping.yaml netbox_fields.auth_field
   --dry-run                 Log changes without writing to NetBox
+  --device-parallelism INT  Devices probed concurrently within one run (default 1)
   --debug                   Enable debug logging
 ```
 

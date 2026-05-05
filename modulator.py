@@ -820,6 +820,7 @@ class Modulator:
         engine: MappingEngine,
         dry_run: bool = False,
         module_policy: str = "drop",
+        device_parallelism: int = 1,
     ):
         """
         module_policy controls how modules already in snmp_exporter_module are handled:
@@ -827,14 +828,20 @@ class Modulator:
           try   — probe existing modules; keep if they still return useful data
           use   — keep existing modules unconditionally (non-destructive / append mode)
         block veto always applies regardless of policy.
+
+        device_parallelism: number of devices probed concurrently within one run
+        (1 = sequential). SNMP probing is I/O-bound, so threads scale well.
         """
         if module_policy not in MODULE_POLICIES:
             raise ValueError(f"module_policy must be one of {MODULE_POLICIES}, got {module_policy!r}")
+        if device_parallelism < 1:
+            raise ValueError(f"device_parallelism must be >= 1, got {device_parallelism}")
         self.nb          = nb
         self.snmp        = snmp   # fallback / single-site client (SNMP_EXPORTER_URL)
         self.engine      = engine
         self.dry_run     = dry_run
         self.module_policy = module_policy
+        self.device_parallelism = device_parallelism
 
         # Polling step ladders are sourced from the NetBox selection custom fields.
         # When either choice set is unavailable, polling calculation is disabled.
@@ -890,15 +897,34 @@ class Modulator:
         devices: list,
         callbacks: Optional[Callbacks] = None,
     ) -> list:
-        """Process a list of DeviceInfo objects and return list[ModulationResult]."""
+        """Process a list of DeviceInfo objects and return list[ModulationResult].
+
+        With device_parallelism > 1, devices are probed concurrently via a
+        ThreadPoolExecutor. Per-device log lines remain distinguishable by IP
+        because each device gets its own logger.
+        """
         if callbacks is None:
             callbacks = Callbacks()
 
-        results = []
-        for device in devices:
+        logger.info(
+            "Starting run: %d device(s)  parallelism=%d",
+            len(devices), self.device_parallelism,
+        )
+
+        def _one(device: DeviceInfo) -> ModulationResult:
             result = self.process_device(device, callbacks)
-            results.append(result)
             callbacks.device_processed("error" if result.error else "success")
+            return result
+
+        if self.device_parallelism <= 1:
+            results = [_one(d) for d in devices]
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(
+                max_workers=self.device_parallelism,
+                thread_name_prefix="dev",
+            ) as ex:
+                results = list(ex.map(_one, devices))
 
         ok  = sum(1 for r in results if not r.error)
         err = sum(1 for r in results if r.error)
