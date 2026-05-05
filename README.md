@@ -348,7 +348,7 @@ Tag changes are batched with the module write when modules changed — one API c
 | `MODULATOR_MAX_CONCURRENT_RUNS` | `1` | Max simultaneous probe jobs (per worker) |
 | `MODULATOR_DEVICE_PARALLELISM` | `1` | Devices probed concurrently within a single run (1 = sequential). SNMP probing is I/O-bound, so 10–20 is usually a safe sweet spot |
 | `MODULATOR_NETBOX_REFRESH_INTERVAL` | `600` | Seconds between NetBox device-count gauge refreshes (set `0` to disable) |
-| `PROMETHEUS_MULTIPROC_DIR` | unset | Enable multiprocess Prometheus metrics (required when workers > 1) |
+| `PROMETHEUS_MULTIPROC_DIR` | auto | Multiprocess Prometheus metrics directory. Auto-set to `/tmp/modulator_metrics` when `MODULATOR_WORKERS>1`; set explicitly to override |
 | `MODULATOR_METRICS_PATH` | `/metrics` | Prometheus metrics endpoint path |
 | `MODULATOR_HOSTNAME` | — | Hostname for Traefik routing label |
 
@@ -400,7 +400,7 @@ NetBox filter params are passed directly to `dcim.devices.filter()`:
 ## Prometheus metrics
 
 ```
-modulator_devices_processed_total{result="success|error"}
+modulator_devices_processed_total{result="success|error|unreachable"}
 modulator_module_tests_total{module="<name>", result="useful|empty|error"}
 modulator_module_test_duration_seconds{module="<name>"}
 modulator_netbox_updates_total{action="changed|unchanged"}

@@ -85,8 +85,9 @@
       "fieldConfig": {
         "defaults": {"unit": "short", "decimals": 0},
         "overrides": [
-          {"matcher": {"id": "byName", "options": "success"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
-          {"matcher": {"id": "byName", "options": "error"},   "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]}
+          {"matcher": {"id": "byName", "options": "success"},     "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
+          {"matcher": {"id": "byName", "options": "error"},       "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]},
+          {"matcher": {"id": "byName", "options": "unreachable"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
         ]
       },
       "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "textMode": "value_and_name"}
@@ -157,8 +158,9 @@
       "fieldConfig": {
         "defaults": {"unit": "ops", "custom": {"drawStyle": "bars", "stacking": {"mode": "normal"}, "lineWidth": 1, "fillOpacity": 70}},
         "overrides": [
-          {"matcher": {"id": "byName", "options": "success"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
-          {"matcher": {"id": "byName", "options": "error"},   "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]}
+          {"matcher": {"id": "byName", "options": "success"},     "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
+          {"matcher": {"id": "byName", "options": "error"},       "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]},
+          {"matcher": {"id": "byName", "options": "unreachable"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
         ]
       },
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}}

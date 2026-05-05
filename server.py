@@ -23,6 +23,31 @@ import threading
 import time
 from typing import Annotated, Optional
 
+# When uvicorn runs with multiple workers, each worker has its own in-memory
+# CollectorRegistry, so /metrics scrapes only see whichever worker happens to
+# answer the request. Auto-enable PROMETHEUS_MULTIPROC_DIR so the prometheus_client
+# multiprocess collector aggregates across workers. Must run BEFORE prometheus_client
+# is imported so the multiprocess value class is selected on first metric creation.
+#
+# Master vs worker: only the master process gets here with the env var unset —
+# workers spawned by uvicorn inherit it from master's environment. So this
+# branch only runs once (in master), making the stale-file cleanup race-free.
+if int(os.getenv("MODULATOR_WORKERS", "4")) > 1 and not os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+    _auto_multiproc_dir = "/tmp/modulator_metrics"
+    os.makedirs(_auto_multiproc_dir, exist_ok=True)
+    for _f in os.listdir(_auto_multiproc_dir):
+        if _f.endswith(".db"):
+            try:
+                os.remove(os.path.join(_auto_multiproc_dir, _f))
+            except OSError:
+                pass
+    os.environ["PROMETHEUS_MULTIPROC_DIR"] = _auto_multiproc_dir
+    print(
+        f"[snmp-modulator] auto-enabled PROMETHEUS_MULTIPROC_DIR={_auto_multiproc_dir} "
+        f"(MODULATOR_WORKERS>1)",
+        flush=True,
+    )
+
 import uvicorn
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import Response

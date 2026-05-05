@@ -92,6 +92,7 @@ class ModulationResult:
     auth_changed: bool = False           # True if auth profile was written back to NetBox
     polling_interval: Optional[str] = None   # new interval written to NetBox (None = unchanged)
     polling_timeout:  Optional[str] = None   # new timeout written to NetBox (None = unchanged)
+    unreachable: bool = False                # all probes returned useless; existing module list preserved
     error: Optional[str] = None
 
 
@@ -929,7 +930,13 @@ class Modulator:
 
         def _one(device: DeviceInfo) -> ModulationResult:
             result = self.process_device(device, callbacks)
-            callbacks.device_processed("error" if result.error else "success")
+            if result.error:
+                outcome = "error"
+            elif result.unreachable:
+                outcome = "unreachable"
+            else:
+                outcome = "success"
+            callbacks.device_processed(outcome)
             return result
 
         if self.device_parallelism <= 1:
@@ -942,10 +949,14 @@ class Modulator:
             ) as ex:
                 results = list(ex.map(_one, devices))
 
-        ok  = sum(1 for r in results if not r.error)
-        err = sum(1 for r in results if r.error)
-        chg = sum(1 for r in results if r.changed)
-        logger.info("Run complete: %d device(s)  ok=%d err=%d changed=%d", len(results), ok, err, chg)
+        ok    = sum(1 for r in results if not r.error and not r.unreachable)
+        err   = sum(1 for r in results if r.error)
+        unrch = sum(1 for r in results if r.unreachable)
+        chg   = sum(1 for r in results if r.changed)
+        logger.info(
+            "Run complete: %d device(s)  ok=%d err=%d unreachable=%d changed=%d",
+            len(results), ok, err, unrch, chg,
+        )
         return results
 
     def process_device(self, device: DeviceInfo, callbacks: Optional[Callbacks] = None) -> ModulationResult:
@@ -1092,6 +1103,19 @@ class Modulator:
             useful_modules = {r.module for r in test_results if r.useful}
             final_modules  = sorted(unconditional | useful_modules)
             previous_modules = sorted(device.current_modules)
+
+            # Unreachable guard: if every probe ran but none returned useful data
+            # AND the device had a populated module list, treat as unreachable and
+            # preserve the existing list rather than wiping it.
+            all_probes_failed = bool(test_results) and not any(r.useful for r in test_results)
+            unreachable       = all_probes_failed and bool(previous_modules)
+            if unreachable:
+                log.warning(
+                    "All %d module probes returned no useful data — device may be unreachable; "
+                    "preserving existing module list", len(test_results),
+                )
+                final_modules = previous_modules
+
             changed = final_modules != previous_modules
 
             if changed:
@@ -1108,7 +1132,9 @@ class Modulator:
             final_set = set(final_modules)
             probed_durations = [r.duration_seconds for r in test_results if r.module in final_set]
             new_interval = new_timeout = None
-            if probed_durations and self._timeout_steps and self._interval_steps:
+            if unreachable:
+                pass  # don't trust durations from a likely-unreachable device
+            elif probed_durations and self._timeout_steps and self._interval_steps:
                 total_s = sum(probed_durations)
                 rec_timeout_s  = _round_up_to_step(total_s * 1.5, self._timeout_steps)
                 rec_interval_s = _round_up_to_step(rec_timeout_s * 2, self._interval_steps)
@@ -1139,7 +1165,7 @@ class Modulator:
             # Vacuously-true (no probing at all, e.g. nuclear veto) is treated as
             # failure so on_fail handlers fire (e.g. "Last-resort discovery" adds
             # fixme/snmp when the device has no auth and nothing could be probed).
-            success  = bool(final_modules) and not any(r.error for r in test_results)
+            success  = bool(final_modules) and not any(r.error for r in test_results) and not unreachable
             handlers = self.engine.evaluate_handlers(matched_rules, success=success)
             add_tags    = handlers["add_tags"]
             remove_tags = handlers["remove_tags"]
@@ -1187,6 +1213,7 @@ class Modulator:
                 auth_changed=auth_changed,
                 polling_interval=new_interval,
                 polling_timeout=new_timeout,
+                unreachable=unreachable,
             )
 
         except Exception as exc:
