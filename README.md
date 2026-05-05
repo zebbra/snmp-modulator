@@ -29,13 +29,11 @@ probing a canary module and checking `up=1`. Written back to `snmp_auth_profile`
 | `snmp_auth_profile` | text | yes | read + **write** (when auth probing resolves a different profile) |
 | `snmp_polling_interval` | selection | no | read + **write** — Prometheus scrape interval; choice set provides the step ladder |
 | `snmp_polling_timeout` | selection | no | read + **write** — Prometheus scrape timeout; choice set provides the step ladder |
-| `snmp_scrape_site` | choice | no | read + **write** — which scraper instance owns this device |
 
 The two mandatory fields must exist on all devices the modulator processes. Field names are configurable in `mapping.yaml` (`modules.field`, `auth.field`) and can be overridden per-run via CLI.
 
 Optional fields are only written when enabled in `mapping.yaml`:
 - `snmp_polling_*` — only when `modules.interval_field` / `modules.timeout_field` are set; omit both to measure and log durations without writing
-- `snmp_scrape_site` — only when `scrape_sites.field` is set
 
 ---
 
@@ -54,10 +52,6 @@ auth:
   field:        snmp_auth_profile        # NetBox text custom field
   policy:       use                      # use | try | drop
   probe_module: system                   # canary module for auth probing; override per-rule
-
-scrape_sites:           # set to ~ to disable; modulator will always probe via SNMP_EXPORTER_URL
-  field:   snmp_scrape_site   # NetBox choice field (value=URL, label=short-name)
-  default: dc1                # label used when no rule matches
 ```
 
 `modules.policy` — how to treat modules already in the field at run start:
@@ -78,25 +72,12 @@ scrape_sites:           # set to ~ to disable; modulator will always probe via S
 
 Rule-level `auth.try` is always probed in the order written — the rule author's preference (e.g. v3 before v2) is honored. With global `policy=try`, the device's current NetBox profile is appended to the end of the candidate list as a final fallback (deduped if already present).
 
-Scrape site assignment is purely rule-driven — no policy, rules always win. The result is written back on every successful probe, keeping the field predictable: an admin can read `mapping.yaml` and know exactly which scraper owns a given device. Use `--dry-run` to preview assignments without writing.
-
-The `snmp_scrape_site` NetBox choice set must have **value = snmp-exporter URL**, **label = short name** (e.g. `dc1`). On startup the modulator fetches these choices and builds a `label → URL` map. Rules and `scrape_sites.default` use labels; the URL value is what gets stored in NetBox and what each scraper filters on:
-
-```
-/probe/netbox?cf_snmp_scrape_site=http://snmp-exporter-dc1:9116
-```
-
-`SNMP_EXPORTER_URL` is the fallback used when a label has no matching choice, and the sole probe URL when `scrape_sites: ~`.
-
-Set `scrape_sites: ~` to disable the feature entirely — `SNMP_EXPORTER_URL` is used for all probing and the `snmp_scrape_site` field is not read or written.
-
 ### defaults
 
 Applied to every device before rules are evaluated:
 
 ```yaml
 defaults:
-  scrape_site: default         # fallback when no rule sets scrape_site
   modules:
     add:   []
     try:   [system, if_full]   # probed — only written if they return useful data
@@ -107,7 +88,7 @@ defaults:
 
 ### Per-rule operations
 
-Each rule has, `modules`, `auth` and `scrape_site`, mirroring the top-level structure:
+Each rule has `modules` and `auth`, mirroring the top-level structure:
 
 ```yaml
 - name: "Example rule"
@@ -130,7 +111,6 @@ Each rule has, `modules`, `auth` and `scrape_site`, mirroring the top-level stru
       - SNMPV3_L3        # probe in order; first returning up=1 wins
       - _ALL             # expand to every auth profile known to snmp-exporter (/config)
     probe_module: if_mib # canary module override for this rule's auth probing
-  scrape_site: dc1       # last-match — most specific rule wins
 ```
 
 Any NetBox field reachable by dot-notation is a valid `match` key:
@@ -159,12 +139,7 @@ auth:
   policy:       use
   probe_module: system
 
-scrape_sites:
-  field:   snmp_scrape_site
-  default: default
-
 defaults:
-  scrape_site: default
   modules:
     add:   []
     try:   [system, if_full]
@@ -174,23 +149,6 @@ defaults:
       - _ALL
 
 rules:
-
-  # ── Scrape site assignment (last-match — put broad rules first) ──
-  - name: "DC1 devices"
-    match:
-      site.slug: "dc1"
-    scrape_site: dc1
-
-  - name: "DC2 devices"
-    match:
-      site.slug: "dc2"
-    scrape_site: dc2
-
-  # Per-device override — sits in DC2 but only reachable from DC1 scraper
-  - name: "Edge router scraped from DC1"
-    match:
-      name: "edge-router-dc2"
-    scrape_site: dc1
 
   # ── Cisco new-access (C9200/C9300) ──────────────────────────────
   - name: "Cisco new-access (C9200/C9300)"
@@ -371,11 +329,6 @@ Tag changes are batched with the module write when modules changed — one API c
 4. Probe each `try` module; keep those returning useful data
 5. Final: `sorted(add ∪ useful_try)`
 
-**Scrape site** (last-match — most specific rule wins):
-1. Start with `defaults.scrape_site`
-2. Walk all rules; each matching rule with `scrape_site:` set overrides the current value
-3. Write to `scrape_sites.field` in NetBox if changed (respects `dry_run`)
-
 ---
 
 ## Environment variables
@@ -439,7 +392,6 @@ NetBox filter params are passed directly to `dcim.devices.filter()`:
 /probe/netbox?role=switch&site=dc1
 /probe/netbox?manufacturer=cisco&last_updated__lt=2025-10-01
 /probe/netbox?tag=discover
-/probe/netbox?snmp_scrape_site=dc1
 ```
 
 ---

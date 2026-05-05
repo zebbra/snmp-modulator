@@ -113,7 +113,6 @@ def main(host, netbox_filter, mapping, module_policy, auth_policy, module_field,
         auth_field=resolved_auth_field,
         interval_field=engine.interval_field,
         timeout_field=engine.timeout_field,
-        scrape_site_field=engine.scrape_site_field,
     )
     verify_tls = os.getenv("SNMP_EXPORTER_TLS_VERIFY", "true").lower() != "false"
     timeout    = int(os.getenv("SNMP_EXPORTER_TIMEOUT", "30"))

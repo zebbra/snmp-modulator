@@ -68,7 +68,6 @@ class DeviceInfo:
     current_modules: list       # from custom_fields.snmp_exporter_module
     polling_interval: Optional[str] = None   # e.g. "3m" — None means use default
     polling_timeout:  Optional[str] = None   # e.g. "2m" — None means use default
-    current_scrape_site: Optional[str] = None  # from custom_fields.snmp_scrape_site
     nb_device: Any = None       # raw pynetbox Record for flexible match key traversal
 
 
@@ -93,8 +92,6 @@ class ModulationResult:
     auth_changed: bool = False           # True if auth profile was written back to NetBox
     polling_interval: Optional[str] = None   # new interval written to NetBox (None = unchanged)
     polling_timeout:  Optional[str] = None   # new timeout written to NetBox (None = unchanged)
-    scrape_site: Optional[str] = None        # resolved scrape site name
-    scrape_site_changed: bool = False        # True if scrape_site was written back to NetBox
     error: Optional[str] = None
 
 
@@ -126,7 +123,6 @@ class NetboxClient:
         auth_field: str = "snmp_auth_profile",
         interval_field: str = "snmp_polling_interval",
         timeout_field: str = "snmp_polling_timeout",
-        scrape_site_field: Optional[str] = None,
     ):
         session = _ChangelogSession(APP_NAME)
         if not verify_tls:
@@ -138,7 +134,6 @@ class NetboxClient:
         self._auth_field        = auth_field
         self._interval_field    = interval_field
         self._timeout_field     = timeout_field
-        self._scrape_site_field = scrape_site_field
         self._valid_modules: Optional[frozenset] = self._fetch_module_choices()
 
     def _fetch_module_choices(self) -> Optional[frozenset]:
@@ -212,36 +207,6 @@ class NetboxClient:
             return None
         return sorted(set(steps))
 
-    def get_scrape_site_choices(self) -> dict:
-        """
-        Fetch {label: url} from the NetBox choice set for the scrape site field.
-
-        The choice set is expected to have value=URL, label=short-name (e.g. "dc1").
-        Returns an empty dict if the field or choice set is not found.
-        """
-        if not self._scrape_site_field:
-            return {}
-        try:
-            cf = self.nb.extras.custom_fields.get(name=self._scrape_site_field)
-            if not cf:
-                return {}
-            choice_set = getattr(cf, "choice_set", None)
-            if choice_set:
-                cs = self.nb.extras.custom_field_choice_sets.get(choice_set.id)
-                if cs:
-                    raw = getattr(cs, "extra_choices", None) or getattr(cs, "choices", None)
-                    if raw:
-                        # raw: [[value, label], ...] — value=URL, label=short-name
-                        result = {label: value for value, label in raw}
-                        logger.info(
-                            "Scrape site choices loaded from NetBox: %s",
-                            {k: v for k, v in result.items()},
-                        )
-                        return result
-        except Exception as exc:
-            logger.warning("Could not fetch scrape site choices from NetBox: %s", exc)
-        return {}
-
     def get_devices(self, **netbox_filter_kwargs) -> list:
         """
         Fetch devices from NetBox using arbitrary filter kwargs passed directly to
@@ -280,8 +245,6 @@ class NetboxClient:
                 current_modules=current_modules,
                 polling_interval=cf.get(self._interval_field) or None,
                 polling_timeout=cf.get(self._timeout_field)   or None,
-                current_scrape_site=cf.get(self._scrape_site_field) or None
-                    if self._scrape_site_field else None,
                 nb_device=dev,
             ))
 
@@ -359,13 +322,6 @@ class NetboxClient:
         """Update the SNMP auth profile text custom field."""
         dev = self.nb.dcim.devices.get(device_id)
         dev.update({"custom_fields": {self._auth_field: profile}})
-
-    def update_scrape_site(self, device_id: int, site: str) -> None:
-        """Update the scrape site choice custom field."""
-        if not self._scrape_site_field:
-            return
-        dev = self.nb.dcim.devices.get(device_id)
-        dev.update({"custom_fields": {self._scrape_site_field: site}})
 
     def apply_tag_changes(self, device_id: int, add_tags: list, remove_tags: list) -> None:
         """Add/remove tags on a device (standalone, when no module update is needed)."""
@@ -604,11 +560,6 @@ class MappingEngine:
             )
         self.auth_probe_module: str = auth_cfg.get("probe_module", "system")
 
-        # ── Scrape sites ──────────────────────────────────────────────────────
-        scrape_sites_cfg         = raw.get("scrape_sites") or {}
-        self.scrape_site_field:         Optional[str] = scrape_sites_cfg.get("field")
-        self._default_scrape_site_name: str           = scrape_sites_cfg.get("default", "default")
-
         # ── Defaults ──────────────────────────────────────────────────────────
         defaults = raw.get("defaults", {})
         def_mod  = defaults.get("modules", {})
@@ -628,7 +579,6 @@ class MappingEngine:
                 "try":            list(mod.get("try",   [])),
                 "block":          list(mod.get("block", [])),
                 "auth":           r.get("auth"),
-                "scrape_site":    r.get("scrape_site"),
                 "on_success":     self._parse_handlers(r.get("on_success") or {}),
                 "on_fail":        self._parse_handlers(r.get("on_fail")    or {}),
             })
@@ -827,20 +777,6 @@ class MappingEngine:
         return expanded
 
 
-    def evaluate_scrape_site(self, device: DeviceInfo) -> str:
-        """
-        Returns the scrape site name for this device (last-match — most specific rule wins).
-        Falls back to defaults.scrape_site ('default' if not set).
-        """
-        site = self._default_scrape_site_name
-        for rule in self._rules:
-            if rule["scrape_site"] is None:
-                continue
-            if self._match_rule(rule, device):
-                site = rule["scrape_site"]
-        return site
-
-
 def _append_unique(value: str, lst: list) -> list:
     """Return lst with value appended as a last-resort fallback, deduped."""
     if value and (not lst or lst[-1] != value):
@@ -913,20 +849,6 @@ class Modulator:
             else:
                 logger.warning("Timeout steps unavailable for %r — polling calculation disabled", engine.timeout_field)
 
-        # Build per-site clients from NetBox choice set (value=URL, label=short-name).
-        # When populated, probes are routed by site label; self.snmp is the fallback.
-        self._site_clients: dict = {}
-        if engine.scrape_site_field:
-            choices = nb.get_scrape_site_choices()   # {label: url}
-            if choices:
-                self._site_clients = {label: snmp.clone(url) for label, url in choices.items()}
-                logger.info("Multi-site mode: %d scrape site(s) loaded", len(self._site_clients))
-            else:
-                logger.warning(
-                    "scrape_sites.field is set but no choices found in NetBox — "
-                    "all devices will probe via SNMP_EXPORTER_URL"
-                )
-
         self._compare_module_sets()
 
     def _apply_handlers(self, device: DeviceInfo, matched_rules: list, success: bool, log) -> None:
@@ -990,29 +912,9 @@ class Modulator:
 
         log = logging.getLogger(f"{APP_NAME}.{device.primary_ip}")
 
-        # Resolve scrape site — label from rules, URL from NetBox choice set
-        site_label  = self.engine.evaluate_scrape_site(device)
-        if self._site_clients:
-            active_snmp = self._site_clients.get(site_label)
-            if active_snmp is None:
-                log.warning("Scrape site label %r not found in NetBox choices — falling back to SNMP_EXPORTER_URL", site_label)
-                active_snmp = self.snmp
-            # NetBox field stores the URL value (choice value=URL)
-            site_value = active_snmp._base_url
-        else:
-            active_snmp = self.snmp
-            site_value  = site_label   # no choice set — write label string
-
-        site_changed = False
-        if self.engine.scrape_site_field and site_value != device.current_scrape_site:
-            site_changed = True
-            log.info("Scrape site: %r → %r", device.current_scrape_site, site_value)
-            if not self.dry_run:
-                self.nb.update_scrape_site(device.id, site_value)
-            else:
-                log.info("DRY RUN — would update scrape_site to %r", site_value)
-        log.info("── device %s  name=%r  auth=%r  scrape_site=%r",
-                 device.primary_ip, device.name, device.snmp_auth_profile, site_label)
+        active_snmp = self.snmp
+        log.info("── device %s  name=%r  auth=%r",
+                 device.primary_ip, device.name, device.snmp_auth_profile)
 
         try:
             # Evaluate rules upfront — needed for handlers even if auth fails early
@@ -1239,8 +1141,6 @@ class Modulator:
                 auth_changed=auth_changed,
                 polling_interval=new_interval,
                 polling_timeout=new_timeout,
-                scrape_site=site_label,
-                scrape_site_changed=site_changed,
             )
 
         except Exception as exc:
