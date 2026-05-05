@@ -869,21 +869,17 @@ class Modulator:
         nb_choices = self.nb._valid_modules
         if not nb_choices:
             return
-        clients = self._site_clients if self._site_clients else {"default": self.snmp}
-        multi   = len(clients) > 1
-        for label, client in clients.items():
-            snmp_modules = set(client.modules)
-            if not snmp_modules:
-                continue
-            prefix         = f"[{label}] " if multi else ""
-            only_in_netbox = nb_choices - snmp_modules
-            only_in_snmp   = snmp_modules - nb_choices
-            if only_in_netbox:
-                logger.warning("%sModule(s) in NetBox but not in snmp-exporter: %s", prefix, sorted(only_in_netbox))
-            if only_in_snmp:
-                logger.warning("%sModule(s) in snmp-exporter but not in NetBox: %s", prefix, sorted(only_in_snmp))
-            if not only_in_netbox and not only_in_snmp:
-                logger.debug("%sNetBox choices and snmp-exporter modules are in sync (%d)", prefix, len(nb_choices))
+        snmp_modules = set(self.snmp.modules)
+        if not snmp_modules:
+            return
+        only_in_netbox = nb_choices - snmp_modules
+        only_in_snmp   = snmp_modules - nb_choices
+        if only_in_netbox:
+            logger.warning("Module(s) in NetBox but not in snmp-exporter: %s", sorted(only_in_netbox))
+        if only_in_snmp:
+            logger.warning("Module(s) in snmp-exporter but not in NetBox: %s", sorted(only_in_snmp))
+        if not only_in_netbox and not only_in_snmp:
+            logger.debug("NetBox choices and snmp-exporter modules are in sync (%d)", len(nb_choices))
 
     def run(
         self,
