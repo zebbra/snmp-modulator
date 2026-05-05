@@ -29,8 +29,6 @@ AUTH_POLICIES     = ("use", "try", "drop")
 # ── Duration helpers ──────────────────────────────────────────────────────────
 
 # Valid choice values for snmp_polling_timeout and snmp_polling_interval fields
-_TIMEOUT_STEPS  = [30, 60, 90, 120, 180, 240, 300, 600, 900]   # seconds
-_INTERVAL_STEPS = [30, 60, 120, 180, 240, 300, 600, 900]        # seconds
 
 
 def _parse_duration(s: str) -> int:
@@ -176,6 +174,43 @@ class NetboxClient:
         except Exception as exc:
             logger.warning("Could not fetch NetBox choices for %r: %s — unknown modules will not be filtered", self._module_field, exc)
         return None
+
+    def _fetch_choice_values(self, field_name: str) -> Optional[list]:
+        """Return the raw value list (str) of a NetBox selection custom field's
+        choice set, or None if the field/choice set is missing or unfetchable."""
+        try:
+            cf = self.nb.extras.custom_fields.get(name=field_name)
+            if not cf:
+                return None
+            choice_set = getattr(cf, "choice_set", None)
+            if not choice_set:
+                return None
+            cs = self.nb.extras.custom_field_choice_sets.get(choice_set.id)
+            if not cs:
+                return None
+            raw = getattr(cs, "extra_choices", None) or getattr(cs, "choices", None)
+            if not raw:
+                return None
+            return [c[0] for c in raw]
+        except Exception as exc:
+            logger.warning("Could not fetch choice set for %r: %s", field_name, exc)
+            return None
+
+    def get_polling_step_values(self, field_name: str) -> Optional[list]:
+        """Return the sorted seconds list parsed from a polling-step choice set,
+        or None when the field is not a selection field with a choice set."""
+        values = self._fetch_choice_values(field_name)
+        if not values:
+            return None
+        steps = []
+        for v in values:
+            try:
+                steps.append(_parse_duration(str(v)))
+            except (ValueError, AttributeError):
+                logger.warning("Choice set %r contains unparseable value %r — skipping", field_name, v)
+        if not steps:
+            return None
+        return sorted(set(steps))
 
     def get_scrape_site_choices(self) -> dict:
         """
@@ -739,11 +774,12 @@ class MappingEngine:
         Resolution:
           Rule-level auth always takes precedence over the global auth_policy:
             auth.use  → unconditional, no probe (works regardless of global policy)
-            auth.try  → probe candidates (works regardless of global policy;
-                         global policy=try prepends current NetBox value)
+            auth.try  → probe candidates in declared order (works regardless of
+                         global policy; global policy=try appends current NetBox
+                         value as a last-resort fallback)
           If no rule matches with an auth section, global policy is the fallback:
             use  → trust NetBox value as-is, no probe
-            try  → prepend NetBox value to defaults.auth.try candidates
+            try  → probe defaults.auth.try in order, NetBox value appended last
             drop → use defaults.auth.try candidates only
         """
         canary = self.auth_probe_module
@@ -764,7 +800,7 @@ class MappingEngine:
                 # Rule explicitly requests auth probing — overrides global auth_policy=use
                 candidates = self._expand_auth_all(list(auth_cfg["try"]), known_auths)
                 if self.auth_policy == "try":
-                    candidates = _prepend_unique(device.snmp_auth_profile, candidates)
+                    candidates = _append_unique(device.snmp_auth_profile, candidates)
                 return None, candidates, rule_canary, rule["name"]
 
         # No matching rule with auth section — apply global policy
@@ -772,7 +808,7 @@ class MappingEngine:
             return device.snmp_auth_profile, [], canary, None
         candidates = self._expand_auth_all(list(self._default_auth_try), known_auths)
         if self.auth_policy == "try":
-            candidates = _prepend_unique(device.snmp_auth_profile, candidates)
+            candidates = _append_unique(device.snmp_auth_profile, candidates)
         return None, candidates, canary, None
 
     @staticmethod
@@ -805,10 +841,10 @@ class MappingEngine:
         return site
 
 
-def _prepend_unique(value: str, lst: list) -> list:
-    """Return lst with value prepended if it isn't already the first element."""
-    if value and (not lst or lst[0] != value):
-        return [value] + [x for x in lst if x != value]
+def _append_unique(value: str, lst: list) -> list:
+    """Return lst with value appended as a last-resort fallback, deduped."""
+    if value and (not lst or lst[-1] != value):
+        return [x for x in lst if x != value] + [value]
     return lst
 
 
@@ -859,6 +895,23 @@ class Modulator:
         self.engine      = engine
         self.dry_run     = dry_run
         self.module_policy = module_policy
+
+        # Polling step ladders are sourced from the NetBox selection custom fields.
+        # When either choice set is unavailable, polling calculation is disabled.
+        self._interval_steps: Optional[list] = None
+        self._timeout_steps:  Optional[list] = None
+        if engine.interval_field:
+            self._interval_steps = nb.get_polling_step_values(engine.interval_field)
+            if self._interval_steps:
+                logger.info("Interval steps from NetBox %r: %s", engine.interval_field, self._interval_steps)
+            else:
+                logger.warning("Interval steps unavailable for %r — polling calculation disabled", engine.interval_field)
+        if engine.timeout_field:
+            self._timeout_steps = nb.get_polling_step_values(engine.timeout_field)
+            if self._timeout_steps:
+                logger.info("Timeout steps from NetBox %r: %s", engine.timeout_field, self._timeout_steps)
+            else:
+                logger.warning("Timeout steps unavailable for %r — polling calculation disabled", engine.timeout_field)
 
         # Build per-site clients from NetBox choice set (value=URL, label=short-name).
         # When populated, probes are routed by site label; self.snmp is the fallback.
@@ -1103,24 +1156,21 @@ class Modulator:
                 log.info("Modules changed — added=%s removed=%s", added, removed)
 
             # ── Polling calculation ───────────────────────────────────────────
-            # Always measure and log; only write back when interval_field/timeout_field
-            # are configured in mapping.yaml (non-None).
+            # Requires both NetBox choice sets to be available; otherwise skipped.
             final_set = set(final_modules)
             probed_durations = [r.duration_seconds for r in test_results if r.module in final_set]
             new_interval = new_timeout = None
-            if probed_durations:
+            if probed_durations and self._timeout_steps and self._interval_steps:
                 total_s = sum(probed_durations)
-                rec_timeout_s  = _round_up_to_step(total_s * 1.5, _TIMEOUT_STEPS)
-                rec_interval_s = _round_up_to_step(rec_timeout_s * 2, _INTERVAL_STEPS)
+                rec_timeout_s  = _round_up_to_step(total_s * 1.5, self._timeout_steps)
+                rec_interval_s = _round_up_to_step(rec_timeout_s * 2, self._interval_steps)
 
-                can_write_polling = bool(self.engine.interval_field or self.engine.timeout_field)
-                if can_write_polling:
-                    cur_timeout_s  = _parse_duration(device.polling_timeout)  if device.polling_timeout  else self.engine.default_timeout
-                    cur_interval_s = _parse_duration(device.polling_interval) if device.polling_interval else self.engine.default_interval
-                    if self.engine.timeout_field  and rec_timeout_s  > cur_timeout_s:
-                        new_timeout  = _format_duration(rec_timeout_s)
-                    if self.engine.interval_field and rec_interval_s > cur_interval_s:
-                        new_interval = _format_duration(rec_interval_s)
+                cur_timeout_s  = _parse_duration(device.polling_timeout)  if device.polling_timeout  else self.engine.default_timeout
+                cur_interval_s = _parse_duration(device.polling_interval) if device.polling_interval else self.engine.default_interval
+                if rec_timeout_s  > cur_timeout_s:
+                    new_timeout  = _format_duration(rec_timeout_s)
+                if rec_interval_s > cur_interval_s:
+                    new_interval = _format_duration(rec_interval_s)
 
                 log.info(
                     "Polling: total_probe=%.1fs  rec_timeout=%s  rec_interval=%s%s",
@@ -1128,8 +1178,12 @@ class Modulator:
                     _format_duration(rec_timeout_s),
                     _format_duration(rec_interval_s),
                     f"  timeout→{new_timeout}  interval→{new_interval}"
-                    if (new_timeout or new_interval) else
-                    "  (no write — fields not configured)" if not can_write_polling else "  ok",
+                    if (new_timeout or new_interval) else "  ok",
+                )
+            elif probed_durations:
+                log.info(
+                    "Polling: total_probe=%.1fs  (calculation skipped — choice set unavailable)",
+                    sum(probed_durations),
                 )
 
             # ── Handlers + NetBox write ───────────────────────────────────────

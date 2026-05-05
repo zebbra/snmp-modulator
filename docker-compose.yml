@@ -18,13 +18,13 @@ services:
       traefik.docker.network: traefik
       # HTTP → HTTPS redirect
       traefik.http.routers.modulator-http-router.entrypoints: http
-      traefik.http.routers.modulator-http-router.rule: Host(`${MODULATOR_HOSTNAME}`) && PathPrefix(`/probe`, `/metrics`, `/health`, `/docs`, `/openapi.json`)
+      traefik.http.routers.modulator-http-router.rule: Host(`${MODULATOR_HOSTNAME}`) && PathPrefix(`/probe`, `/modulator_metrics`, `/health`, `/docs`, `/openapi.json`)
       traefik.http.routers.modulator-http-router.middlewares: modulator-redirect
       traefik.http.middlewares.modulator-redirect.redirectscheme.scheme: https
       # HTTPS
       traefik.http.routers.modulator-https-router.entrypoints: https
       traefik.http.routers.modulator-https-router.tls: "true"
-      traefik.http.routers.modulator-https-router.rule: Host(`${MODULATOR_HOSTNAME}`) && PathPrefix(`/probe`, `/metrics`, `/health`, `/docs`, `/openapi.json`)
+      traefik.http.routers.modulator-https-router.rule: Host(`${MODULATOR_HOSTNAME}`) && PathPrefix(`/probe`, `/modulator_metrics`, `/health`, `/docs`, `/openapi.json`)
       traefik.http.services.modulator-service.loadbalancer.server.port: "8081"
       traefik.http.services.modulator-service.loadbalancer.server.scheme: http
 

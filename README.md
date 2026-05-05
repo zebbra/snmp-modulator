@@ -27,8 +27,8 @@ probing a canary module and checking `up=1`. Written back to `snmp_auth_profile`
 |---|---|---|---|
 | `snmp_exporter_module` | multi-select (choice set) | yes | read + **write** — final module list |
 | `snmp_auth_profile` | text | yes | read + **write** (when auth probing resolves a different profile) |
-| `snmp_polling_interval` | text | no | read + **write** — Prometheus scrape interval |
-| `snmp_polling_timeout` | text | no | read + **write** — Prometheus scrape timeout |
+| `snmp_polling_interval` | selection | no | read + **write** — Prometheus scrape interval; choice set provides the step ladder |
+| `snmp_polling_timeout` | selection | no | read + **write** — Prometheus scrape timeout; choice set provides the step ladder |
 | `snmp_scrape_site` | choice | no | read + **write** — which scraper instance owns this device |
 
 The two mandatory fields must exist on all devices the modulator processes. Field names are configurable in `mapping.yaml` (`modules.field`, `auth.field`) and can be overridden per-run via CLI.
@@ -73,8 +73,10 @@ scrape_sites:           # set to ~ to disable; modulator will always probe via S
 | Value | Meaning |
 |---|---|
 | `use` | Trust NetBox value as-is; no probing. May be overridden per-rule with `auth.try`. |
-| `try` | Validate NetBox value first; fall through to rule candidates if it fails |
+| `try` | Probe rule candidates in declared order; NetBox value appended as last-resort fallback |
 | `drop` | Ignore NetBox value; discover working profile from rule candidates only |
+
+Rule-level `auth.try` is always probed in the order written — the rule author's preference (e.g. v3 before v2) is honored. With global `policy=try`, the device's current NetBox profile is appended to the end of the candidate list as a final fallback (deduped if already present).
 
 Scrape site assignment is purely rule-driven — no policy, rules always win. The result is written back on every successful probe, keeping the field predictable: an admin can read `mapping.yaml` and know exactly which scraper owns a given device. Use `--dry-run` to preview assignments without writing.
 
@@ -392,6 +394,7 @@ Tag changes are batched with the module write when modules changed — one API c
 | `MODULATOR_PORT` | `8080` | Server listen port |
 | `MODULATOR_WORKERS` | `4` | uvicorn worker count |
 | `MODULATOR_MAX_CONCURRENT_RUNS` | `1` | Max simultaneous probe jobs |
+| `MODULATOR_NETBOX_REFRESH_INTERVAL` | `600` | Seconds between NetBox device-count gauge refreshes (set `0` to disable) |
 | `PROMETHEUS_MULTIPROC_DIR` | unset | Enable multiprocess Prometheus metrics (required when workers > 1) |
 | `MODULATOR_METRICS_PATH` | `/metrics` | Prometheus metrics endpoint path |
 | `MODULATOR_HOSTNAME` | — | Hostname for Traefik routing label |
@@ -451,7 +454,12 @@ modulator_netbox_updates_total{action="changed|unchanged"}
 modulator_auth_probe_results_total{result="resolved|failed|skipped"}
 modulator_probe_duration_seconds
 modulator_probe_in_progress
+modulator_netbox_devices_by_auth{profile="<name>"}
+modulator_netbox_devices_by_module{module="<name>"}
+modulator_netbox_devices_refresh_duration_seconds
 ```
+
+`modulator_netbox_devices_by_auth` and `modulator_netbox_devices_by_module` are seeded from snmp-exporter `/config`, so every known profile/module appears — including with value `0` when no device uses it. That makes "find unused" a one-liner: `modulator_netbox_devices_by_auth == 0`. Refresh cadence is controlled by `MODULATOR_NETBOX_REFRESH_INTERVAL` (one cheap pagination-count query per known value, no full device fetch).
 
 ---
 
@@ -475,9 +483,11 @@ durations. Measurement and logging always happen; write-back only occurs when
 
 ```
 total    = sum of scrape_duration_seconds for all modules in the final set
-timeout  = round_up(total × 1.5)  → next step in [30s, 1m, 90s, 2m, 3m, 4m, 5m, 10m, 15m]
-interval = round_up(timeout × 2)  → next step in [30s, 1m, 2m, 3m, 4m, 5m, 10m, 15m]
+timeout  = round_up(total × 1.5)  → next step in the timeout choice set
+interval = round_up(timeout × 2)  → next step in the interval choice set
 ```
+
+The step ladders are read from the NetBox selection custom fields (`snmp_polling_interval` / `snmp_polling_timeout`) at startup — the choice set on each field is the source of truth, so ops can adjust the allowed steps without redeploying. If either choice set is missing or unfetchable, polling calculation is **disabled** (logged at startup, no recommendation, no write-back); module probing continues normally.
 
 Only modules that made it into the final set contribute to `total` — probed modules that returned
 no useful data are excluded. Unconditional (`add`) modules are also excluded since they are not probed.

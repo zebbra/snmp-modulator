@@ -137,9 +137,10 @@ def main(host, netbox_filter, mapping, module_policy, auth_policy, module_field,
             sys.exit(1)
         devices = [device]
     else:
+        qs = netbox_filter.lstrip("?")
         filter_kwargs = {
             k: v[0] if len(v) == 1 else v
-            for k, v in urllib.parse.parse_qs(netbox_filter, keep_blank_values=False).items()
+            for k, v in urllib.parse.parse_qs(qs, keep_blank_values=False).items()
         }
         log.info("NetBox filter: %s", filter_kwargs)
         devices = nb.get_devices(**filter_kwargs)

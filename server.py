@@ -114,6 +114,26 @@ probe_in_progress = Gauge(
     multiprocess_mode="livesum",
     **_reg,
 )
+netbox_devices_by_auth = Gauge(
+    "modulator_netbox_devices_by_auth",
+    "Devices in NetBox per snmp auth profile (zero for profiles known to snmp-exporter but unused)",
+    ["profile"],
+    multiprocess_mode="livemax",
+    **_reg,
+)
+netbox_devices_by_module = Gauge(
+    "modulator_netbox_devices_by_module",
+    "Devices in NetBox per snmp-exporter module (zero for modules known to snmp-exporter but unused)",
+    ["module"],
+    multiprocess_mode="livemax",
+    **_reg,
+)
+netbox_devices_refresh_duration = Histogram(
+    "modulator_netbox_devices_refresh_duration_seconds",
+    "Duration of the NetBox device-count refresh cycle",
+    buckets=[1, 5, 10, 30, 60, 120, 300],
+    **_reg,
+)
 
 
 class _ServerCallbacks(Callbacks):
@@ -147,6 +167,7 @@ _METRICS_PATH:   str           = os.getenv("MODULATOR_METRICS_PATH", "/metrics")
 _DRY_RUN:       bool = _flag("MODULATOR_DRY_RUN")
 _MAPPING_FILE:  str  = os.getenv("MAPPING_FILE", "mapping.yaml")
 _MAX_CONCURRENT: int           = int(os.getenv("MODULATOR_MAX_CONCURRENT_RUNS", "1"))
+_NETBOX_REFRESH_INTERVAL: int = int(os.getenv("MODULATOR_NETBOX_REFRESH_INTERVAL", "600"))
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -196,6 +217,53 @@ def _make_clients():
         timeout=timeout,
     )
     return nb, snmp, engine, module_policy
+
+
+def _refresh_device_counts() -> None:
+    """Update by-profile/by-module gauges from NetBox count queries.
+
+    One cheap `?cf_<field>=<value>&limit=1` query per known auth profile and per
+    known module — counts come from pagination metadata, no full fetch.
+    """
+    t0 = time.time()
+    nb, snmp, engine, _ = _make_clients()
+
+    if not snmp.auths and not snmp.modules:
+        logger.warning("NetBox device counts: snmp-exporter /config returned no auths/modules — skipping")
+        return
+
+    auth_ok = mod_ok = 0
+    for profile in snmp.auths:
+        try:
+            n = nb.nb.dcim.devices.filter(**{f"cf_{engine.auth_field}": profile}).count()
+            netbox_devices_by_auth.labels(profile=profile).set(n)
+            auth_ok += 1
+        except Exception as exc:
+            logger.warning("NetBox device counts: auth count for %r failed: %s", profile, exc)
+
+    for module in snmp.modules:
+        try:
+            n = nb.nb.dcim.devices.filter(**{f"cf_{engine.module_field}": module}).count()
+            netbox_devices_by_module.labels(module=module).set(n)
+            mod_ok += 1
+        except Exception as exc:
+            logger.warning("NetBox device counts: module count for %r failed: %s", module, exc)
+
+    elapsed = time.time() - t0
+    netbox_devices_refresh_duration.observe(elapsed)
+    logger.info(
+        "NetBox device counts: %d/%d auth profiles, %d/%d modules in %.1fs",
+        auth_ok, len(snmp.auths), mod_ok, len(snmp.modules), elapsed,
+    )
+
+
+def _device_count_loop() -> None:
+    while True:
+        try:
+            _refresh_device_counts()
+        except Exception as exc:
+            logger.error("NetBox device counts refresh failed: %s", exc, exc_info=True)
+        time.sleep(_NETBOX_REFRESH_INTERVAL)
 
 
 def _run_probe(job_key: str, devices_fn) -> None:
@@ -309,6 +377,15 @@ async def metrics() -> Response:
     else:
         content = generate_latest(_custom_registry)
     return Response(content=content, media_type=CONTENT_TYPE_LATEST)
+
+
+@app.on_event("startup")
+def _start_device_count_refresher() -> None:
+    if _NETBOX_REFRESH_INTERVAL <= 0:
+        logger.info("NetBox device counts refresh disabled (MODULATOR_NETBOX_REFRESH_INTERVAL<=0)")
+        return
+    threading.Thread(target=_device_count_loop, daemon=True, name="netbox-device-counts").start()
+    logger.info("NetBox device counts refresher started (interval=%ds)", _NETBOX_REFRESH_INTERVAL)
 
 
 @app.get("/health", summary="Liveness check")
