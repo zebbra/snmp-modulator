@@ -406,6 +406,7 @@ modulator_module_changes_total{module="<name>", action="added|removed"}
 modulator_auth_probe_results_total{result="resolved|failed|skipped"}
 modulator_probe_duration_seconds
 modulator_probe_in_progress
+modulator_probe_jobs_in_flight
 modulator_netbox_devices_by_auth{profile="<name>"}
 modulator_netbox_devices_by_module{module="<name>"}
 modulator_netbox_devices_refresh_duration_seconds

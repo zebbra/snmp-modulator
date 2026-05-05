@@ -120,6 +120,12 @@ probe_in_progress = Gauge(
     multiprocess_mode="livesum",
     **_reg,
 )
+probe_jobs_in_flight = Gauge(
+    "modulator_probe_jobs_in_flight",
+    "Probe jobs accepted but not yet finished (running + queued); queue depth = this minus modulator_probe_in_progress",
+    multiprocess_mode="livesum",
+    **_reg,
+)
 netbox_devices_by_auth = Gauge(
     "modulator_netbox_devices_by_auth",
     "Devices in NetBox per snmp auth profile (zero for profiles known to snmp-exporter but unused)",
@@ -292,6 +298,7 @@ def _run_probe(job_key: str, devices_fn) -> None:
         _probe_semaphore.release()
         with _in_flight_lock:
             _in_flight.discard(job_key)
+        probe_jobs_in_flight.dec()
         logger.info("Probe job %r finished in %.1fs", job_key, time.time() - start)
 
 
@@ -320,6 +327,7 @@ async def probe_host(
         if job_key in _in_flight:
             return {"status": "skipped", "host": host, "reason": "already in progress"}
         _in_flight.add(job_key)
+    probe_jobs_in_flight.inc()
 
     def fetch(nb: NetboxClient):
         device = nb.get_device_by_host(host)
@@ -367,6 +375,7 @@ async def probe_netbox(
         if job_key in _in_flight:
             return {"status": "skipped", "filter": filter_params, "reason": "already in progress"}
         _in_flight.add(job_key)
+    probe_jobs_in_flight.inc()
 
     def fetch(nb: NetboxClient):
         return nb.get_devices(**filter_params)

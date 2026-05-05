@@ -48,12 +48,15 @@
     },
     {
       "type": "stat",
-      "title": "Probe jobs in progress",
+      "title": "Probe jobs (running / queued)",
       "id": 1,
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "gridPos": {"h": 4, "w": 6, "x": 0, "y": 1},
       "targets": [
-        {"refId": "A", "expr": "sum(modulator_probe_in_progress)", "legendFormat": "in flight"}
+        {"refId": "A", "expr": "sum(modulator_probe_in_progress)", "legendFormat": "running"},
+        {"refId": "B",
+         "expr": "clamp_min(sum(modulator_probe_jobs_in_flight) - sum(modulator_probe_in_progress), 0)",
+         "legendFormat": "queued"}
       ],
       "fieldConfig": {
         "defaults": {
@@ -68,7 +71,7 @@
           }
         }
       },
-      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "textMode": "auto"}
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "textMode": "value_and_name"}
     },
     {
       "type": "stat",
@@ -374,6 +377,52 @@
         {"id": "sortBy", "options": {"sort": [{"field": "Module (zero devices)"}]}}
       ],
       "fieldConfig": {"defaults": {}}
+    },
+
+    {
+      "type": "row",
+      "title": "Module churn",
+      "id": 106,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 60},
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Module add/remove rate",
+      "id": 60,
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 61},
+      "targets": [
+        {"refId": "A", "expr": "sum by (action) (rate(modulator_module_changes_total[5m]))", "legendFormat": "{{action}}"}
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "ops", "custom": {"drawStyle": "bars", "stacking": {"mode": "normal"}, "lineWidth": 1, "fillOpacity": 70}},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "added"},   "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
+          {"matcher": {"id": "byName", "options": "removed"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]}
+        ]
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}}
+    },
+    {
+      "type": "table",
+      "title": "Top module changes (24h)",
+      "id": 61,
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 61},
+      "targets": [
+        {"refId": "A",
+         "expr": "topk(20, sum by (module, action) (increase(modulator_module_changes_total[24h])))",
+         "format": "table", "instant": true}
+      ],
+      "transformations": [
+        {"id": "organize", "options": {
+          "excludeByName": {"Time": true, "__name__": true, "instance": true, "job": true},
+          "renameByName": {"module": "Module", "action": "Action", "Value": "Count (24h)"}
+        }},
+        {"id": "sortBy", "options": {"sort": [{"field": "Count (24h)", "desc": true}]}}
+      ],
+      "fieldConfig": {"defaults": {"decimals": 0}}
     }
   ]
 }
