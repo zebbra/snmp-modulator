@@ -167,7 +167,10 @@ class NetboxClient:
                 return choices
 
         except Exception as exc:
-            logger.warning("Could not fetch NetBox choices for %r: %s — unknown modules will not be filtered", self._module_field, exc)
+            logger.warning(
+                "Could not fetch NetBox choices for %r: %s — unknown modules will not be filtered",
+                self._module_field, exc,
+            )
         return None
 
     def _fetch_choice_values(self, field_name: str) -> Optional[list]:
@@ -871,7 +874,9 @@ class Modulator:
             if self._interval_steps:
                 logger.info("Interval steps from NetBox %r: %s", engine.interval_field, self._interval_steps)
             else:
-                logger.warning("Interval steps unavailable for %r — polling calculation disabled", engine.interval_field)
+                logger.warning(
+                    "Interval steps unavailable for %r — polling calculation disabled", engine.interval_field
+                )
         if engine.timeout_field:
             self._timeout_steps = nb.get_polling_step_values(engine.timeout_field)
             if self._timeout_steps:
@@ -1141,8 +1146,13 @@ class Modulator:
                 rec_timeout_s  = _round_up_to_step(total_s * 1.5, self._timeout_steps)
                 rec_interval_s = _round_up_to_step(rec_timeout_s * 2, self._interval_steps)
 
-                cur_timeout_s  = _parse_duration(device.polling_timeout)  if device.polling_timeout  else self.engine.default_timeout
-                cur_interval_s = _parse_duration(device.polling_interval) if device.polling_interval else self.engine.default_interval
+                cur_timeout_s = (
+                    _parse_duration(device.polling_timeout) if device.polling_timeout else self.engine.default_timeout
+                )
+                cur_interval_s = (
+                    _parse_duration(device.polling_interval) if device.polling_interval
+                    else self.engine.default_interval
+                )
                 if rec_timeout_s  > cur_timeout_s:
                     new_timeout  = _format_duration(rec_timeout_s)
                 if rec_interval_s > cur_interval_s:
@@ -1219,7 +1229,7 @@ class Modulator:
             )
 
         except Exception as exc:
-            log.error("Failed to process %r: %s", device.name, exc, exc_info=True)
+            log.exception("Failed to process %r: %s", device.name, exc)
             return ModulationResult(
                 device_id=device.id,
                 device_name=device.name,

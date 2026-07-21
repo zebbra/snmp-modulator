@@ -1,5 +1,8 @@
 # SNMP MODULATOR
 
+[![CI](https://github.com/zebbra/snmp-modulator/actions/workflows/ci.yml/badge.svg)](https://github.com/zebbra/snmp-modulator/actions/workflows/ci.yml)
+[![Image](https://img.shields.io/badge/quay.io-zebbra%2Fsnmp--modulator-blue)](https://quay.io/repository/zebbra/snmp-modulator)
+
 <p align="center">
   <img src="banner.svg" alt="SNMP-Modulator" />
 </p>
@@ -19,17 +22,13 @@ flowchart LR
     MOD["snmp-modulator"]
     SNMP["snmp-exporter"]
     DEV["Network Devices"]
-    PROM["Prometheus / VictoriaMetrics"]
-    ALERT["vmalert"]
 
     TRIG -- "starts a run" --> MOD
     NB -- "fetch devices (by host / filter)" --> MOD
     MOD -- "GET /snmp?target&module&auth" --> SNMP
     SNMP -- SNMP --> DEV
     MOD -- "write snmp_exporter_module,\nsnmp_auth_profile, tags" --> NB
-    PROM -- "scrape /metrics" --> MOD
     MOD -. "device counts by auth/module\n(GET /config)" .-> SNMP
-    ALERT -- "evaluate rules" --> PROM
 ```
 
 Two ways to run it: the **server** (`server.py`) sits behind Traefik and runs probes on demand when `/probe` or `/probe/netbox` is called, exposing Prometheus metrics continuously; the **CLI** (`cli.py`) does a single one-shot run and exits. Both share the same `Modulator`/`MappingEngine` core in `modulator.py`.

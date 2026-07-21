@@ -12,6 +12,8 @@ import sys
 import tempfile
 from types import SimpleNamespace
 
+import pytest
+
 # Isolate Prometheus multiprocess state in a throwaway dir before server.py is
 # imported — module-level code auto-enables PROMETHEUS_MULTIPROC_DIR otherwise.
 _TMPDIR = tempfile.mkdtemp(prefix="modulator-test-")
@@ -19,8 +21,6 @@ os.environ["PROMETHEUS_MULTIPROC_DIR"] = _TMPDIR
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
-
-import pytest
 
 
 def _import_server_as(name: str):
@@ -41,7 +41,6 @@ def test_server_imports_twice_without_registry_collision() -> None:
 
 
 import server  # noqa: E402
-
 
 # ── filter key validation ───────────────────────────────────────────────────────
 

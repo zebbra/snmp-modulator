@@ -6,10 +6,60 @@ on:
     branches:
       - main
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   QUAY_IMAGE: quay.io/zebbra/snmp-modulator
 
 jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: hetzner
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Lint
+        run: ruff check .
+
+  audit:
+    name: Security audit (pip-audit)
+    runs-on: hetzner
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Run pip-audit
+        # Centralized ignore list (only currently-detected findings). Each entry:
+        # caused by <package==version>, fix <version> — remove once the underlying
+        # pin is bumped and re-verified.
+        run: >
+          pip-audit -r requirements.txt
+          --ignore-vuln PYSEC-2026-161
+          --ignore-vuln PYSEC-2026-248
+          --ignore-vuln PYSEC-2026-249
+          --ignore-vuln PYSEC-2026-1942
+          --ignore-vuln PYSEC-2026-1941
+          --ignore-vuln PYSEC-2026-2281
+          --ignore-vuln PYSEC-2026-2280
+        # PYSEC-2026-{161,248,249,1942,1941,2281,2280}: starlette==0.46.2 (transitive via
+        #   fastapi==0.115.12), fixes require a starlette 0.47+/1.x line — needs a fastapi
+        #   bump + compatibility check, tracked separately
+
   test:
     name: Test
     runs-on: hetzner
@@ -28,7 +78,7 @@ jobs:
 
   build:
     name: Build Docker image
-    needs: test
+    needs: [lint, audit, test]
     runs-on: hetzner
     steps:
       - uses: actions/checkout@v6

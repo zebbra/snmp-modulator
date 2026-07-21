@@ -61,7 +61,7 @@ from prometheus_client import (
 )
 from prometheus_client.multiprocess import MultiProcessCollector
 
-from modulator import AUTH_POLICIES, Callbacks, MappingEngine, Modulator, NetboxClient, SnmpExporterClient
+from modulator import Callbacks, MappingEngine, Modulator, NetboxClient, SnmpExporterClient
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -307,7 +307,7 @@ def _device_count_loop() -> None:
         try:
             _refresh_device_counts()
         except Exception as exc:
-            logger.error("NetBox device counts refresh failed: %s", exc, exc_info=True)
+            logger.exception("NetBox device counts refresh failed: %s", exc)
         time.sleep(_NETBOX_REFRESH_INTERVAL)
 
 
@@ -327,7 +327,7 @@ def _run_probe(job_key: str, devices_fn) -> None:
         devices = devices_fn(nb)
         mod.run(devices, callbacks=_ServerCallbacks())
     except Exception as exc:
-        logger.error("Probe job %r failed: %s", job_key, exc, exc_info=True)
+        logger.exception("Probe job %r failed: %s", job_key, exc)
     finally:
         probe_in_progress.dec()
         probe_duration.observe(time.time() - start)

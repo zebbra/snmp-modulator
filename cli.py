@@ -75,7 +75,8 @@ from modulator import AUTH_POLICIES, MODULE_POLICIES, MappingEngine, Modulator, 
               is_flag=True,
               default=False,
               help="Enable debug logging.")
-def main(host, netbox_filter, mapping, module_policy, auth_policy, module_field, auth_field, dry_run, device_parallelism, debug):
+def main(host, netbox_filter, mapping, module_policy, auth_policy, module_field, auth_field,
+         dry_run, device_parallelism, debug):
     """Run SNMP module modulation for matching NetBox devices."""
 
     logging.basicConfig(
