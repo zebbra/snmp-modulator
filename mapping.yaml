@@ -174,8 +174,8 @@ rules:
       custom_fields.service_group: "sdwan"
     auth:
       try:
-        - ETZ_SNMP_L3
-        - ETZ_SNMP_L2
+        - SNMPV3_L3
+        - SNMPV3_L2
     modules:
       try:
         - bgp
@@ -312,13 +312,6 @@ rules:
         - host_ressources
         - if_full_legacy
         - system
-
-  - name: "RunIP — no SNMP"
-    match:
-      device_type.manufacturer.slug: "runip"
-    modules:
-      block:
-        - _ALL
 
 # ── Last Resorts ─────────────────────────────────────────────────────────────
 

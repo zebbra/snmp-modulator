@@ -31,7 +31,7 @@ flowchart LR
     MOD -. "device counts by auth/module\n(GET /config)" .-> SNMP
 ```
 
-Two ways to run it: the **server** (`server.py`) sits behind Traefik and runs probes on demand when `/probe` or `/probe/netbox` is called, exposing Prometheus metrics continuously; the **CLI** (`cli.py`) does a single one-shot run and exits. Both share the same `Modulator`/`MappingEngine` core in `modulator.py`.
+Two ways to run it: the **server** (`server.py`) runs probes on demand when `/probe` or `/probe/netbox` is called, exposing Prometheus metrics continuously; the **CLI** (`cli.py`) does a single one-shot run and exits. Both share the same `Modulator`/`MappingEngine` core in `modulator.py`.
 
 ---
 
@@ -377,7 +377,6 @@ Tag changes are batched with the module write when modules changed — one API c
 | `MODULATOR_NETBOX_REFRESH_INTERVAL` | `600` | Seconds between NetBox device-count gauge refreshes (set `0` to disable) |
 | `PROMETHEUS_MULTIPROC_DIR` | auto | Multiprocess Prometheus metrics directory. Auto-set to `/tmp/modulator_metrics` when `MODULATOR_WORKERS>1`; set explicitly to override |
 | `MODULATOR_METRICS_PATH` | `/metrics` | Prometheus metrics endpoint path |
-| `MODULATOR_HOSTNAME` | — | Hostname for Traefik routing label |
 
 `modules.policy`, `auth.policy`, and field names are configured in `mapping.yaml`.
 They can be overridden per-run with CLI arguments but not via environment variables.
@@ -442,18 +441,6 @@ modulator_netbox_devices_refresh_duration_seconds
 ```
 
 `modulator_netbox_devices_by_auth` and `modulator_netbox_devices_by_module` are seeded from snmp-exporter `/config`, so every known profile/module appears — including with value `0` when no device uses it. That makes "find unused" a one-liner: `modulator_netbox_devices_by_auth == 0`. Refresh cadence is controlled by `MODULATOR_NETBOX_REFRESH_INTERVAL` (one cheap pagination-count query per known value, no full device fetch).
-
----
-
-## TLS / custom CA
-
-Place a `ca-bundle.pem` next to `Dockerfile` before building. It is injected into the container
-and used for `pip install` and for requests to NetBox / snmp-exporter at runtime.
-
-```bash
-cp /etc/ssl/certs/ca-bundle.pem .
-docker compose build
-```
 
 ---
 

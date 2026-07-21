@@ -12,15 +12,7 @@ ENV http_proxy=$http_proxy \
     no_proxy=$no_proxy
 
 COPY requirements.txt .
-# If ca-bundle.pem exists in the repo root, install with it; otherwise install normally.
-# To use a custom CA: cp /etc/ssl/ca-bundle.pem . (gitignored)
-RUN --mount=type=bind,source=.,target=/ctx \
-    if [ -f /ctx/ca-bundle.pem ]; then \
-      cp /ctx/ca-bundle.pem /etc/ssl/ca-bundle.pem && \
-      pip install --no-cache-dir --cert /etc/ssl/ca-bundle.pem -r requirements.txt; \
-    else \
-      pip install --no-cache-dir -r requirements.txt; \
-    fi
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY modulator.py server.py cli.py mapping.yaml ./
 
