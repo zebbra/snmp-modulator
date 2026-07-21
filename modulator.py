@@ -50,9 +50,8 @@ def _format_duration(seconds: int) -> str:
 
 def _round_up_to_step(seconds: float, steps: list) -> int:
     """Round up to the nearest value in steps; cap at the maximum step."""
-    target = int(seconds)
     for step in steps:
-        if step >= target:
+        if step >= seconds:
             return step
     return steps[-1]
 
@@ -650,9 +649,12 @@ class MappingEngine:
                 test.update(rule["try"])
                 block.update(rule["block"])
 
-        # _ALL in block — nuclear veto, nothing survives
+        # _ALL in block — nuclear veto, nothing survives. Expand to every known
+        # module plus the device's current modules so module_policy=use/try
+        # can't resurrect pre-existing modules the veto is meant to strip.
         if "_ALL" in block:
-            return set(), set(), block, matched_names, matched_rules
+            full_block = (block - {"_ALL"}) | set(known_modules) | set(device.current_modules)
+            return set(), set(), full_block, matched_names, matched_rules
 
         # _ALL in test — expand to every known module
         if "_ALL" in test:
@@ -1027,7 +1029,7 @@ class Modulator:
                 if resolved_auth is None:
                     log.warning("Auth: no working profile found for %r — skipping device", device.name)
                     callbacks.auth_probed("failed")
-                    self._apply_handlers(device, [], success=False, log=log)
+                    self._apply_handlers(device, matched_rules, success=False, log=log)
                     return ModulationResult(
                         device_id=device.id,
                         device_name=device.name,
@@ -1056,7 +1058,7 @@ class Modulator:
                     self.engine.auth_policy, device.name,
                 )
                 callbacks.auth_probed("failed")
-                self._apply_handlers(device, [], success=False, log=log)
+                self._apply_handlers(device, matched_rules, success=False, log=log)
                 return ModulationResult(
                     device_id=device.id,
                     device_name=device.name,
