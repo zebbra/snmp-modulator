@@ -6,6 +6,7 @@ Run with `pytest tests/` or directly:
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import os
 import sys
@@ -106,6 +107,37 @@ def test_run_probe_releases_semaphore_and_clears_in_flight(monkeypatch) -> None:
     assert before == after  # incremented then decremented back to baseline
     assert ran == [["dev1"]]
     assert "host:10.0.0.1" not in server._in_flight
+
+
+# ── _metric_samples / _metric_value ─────────────────────────────────────────────
+
+def test_metric_samples_reads_labeled_gauge_values() -> None:
+    server.netbox_devices_by_auth.labels(profile="public_v2").set(7)
+    assert server._metric_samples("modulator_netbox_devices_by_auth")[(("profile", "public_v2"),)] == 7
+
+
+def test_metric_value_reads_unlabeled_gauge() -> None:
+    server.probe_in_progress.inc()
+    try:
+        assert server._metric_value("modulator_probe_in_progress") >= 1
+    finally:
+        server.probe_in_progress.dec()
+
+
+# ── / dashboard ──────────────────────────────────────────────────────────────────
+
+def test_index_lists_in_flight_jobs_and_device_counts() -> None:
+    server.netbox_devices_by_auth.labels(profile="public_v2").set(5)
+    server.netbox_devices_by_module.labels(module="if_mib").set(3)
+    server._in_flight.add("host:10.0.0.1")
+    try:
+        html = asyncio.run(server.index())
+    finally:
+        server._in_flight.discard("host:10.0.0.1")
+
+    assert "host:10.0.0.1" in html
+    assert "public_v2" in html
+    assert "if_mib" in html
 
 
 if __name__ == "__main__":

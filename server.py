@@ -21,6 +21,7 @@ import os
 import re
 import threading
 import time
+from contextlib import asynccontextmanager
 from typing import Annotated, Optional
 
 # When uvicorn runs with multiple workers, each worker has its own in-memory
@@ -50,7 +51,7 @@ if int(os.getenv("MODULATOR_WORKERS", "4")) > 1 and not os.environ.get("PROMETHE
 
 import uvicorn
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import Response
+from fastapi.responses import HTMLResponse, Response
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     CollectorRegistry,
@@ -174,6 +175,24 @@ netbox_devices_refresh_duration = Histogram(
 )
 
 
+def _metric_samples(name: str) -> dict[tuple, float]:
+    """Current values for a metric, aggregated across workers when multiprocess."""
+    if _MULTIPROC_DIR:
+        reg = CollectorRegistry()
+        MultiProcessCollector(reg)
+    else:
+        reg = _custom_registry
+    return {
+        tuple(sorted(s.labels.items())): s.value
+        for metric in reg.collect() if metric.name == name
+        for s in metric.samples if s.name == name
+    }
+
+
+def _metric_value(name: str) -> float:
+    return next(iter(_metric_samples(name).values()), 0.0)
+
+
 class _ServerCallbacks(Callbacks):
     def module_test(self, module: str, result: str) -> None:
         module_tests_total.labels(module=module, result=result).inc()
@@ -227,10 +246,18 @@ async def require_auth(authorization: Annotated[str, Header()] = "") -> None:
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    _start_device_count_refresher()
+    yield
+
+
 app = FastAPI(
     title="snmp-modulator",
     description="Probe NetBox devices against snmp-exporter and update snmp_exporter_module",
     version="1.0.0",
+    lifespan=_lifespan,
 )
 
 # Active probe job keys — prevents duplicate concurrent probes for the same target
@@ -444,13 +471,79 @@ async def metrics() -> Response:
     return Response(content=content, media_type=CONTENT_TYPE_LATEST)
 
 
-@app.on_event("startup")
 def _start_device_count_refresher() -> None:
     if _NETBOX_REFRESH_INTERVAL <= 0:
         logger.info("NetBox device counts refresh disabled (MODULATOR_NETBOX_REFRESH_INTERVAL<=0)")
         return
     threading.Thread(target=_device_count_loop, daemon=True, name="netbox-device-counts").start()
     logger.info("NetBox device counts refresher started (interval=%ds)", _NETBOX_REFRESH_INTERVAL)
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def index() -> str:
+    with _in_flight_lock:
+        in_flight = sorted(_in_flight)
+
+    by_auth = sorted(
+        (dict(k).get("profile", "?"), int(v)) for k, v in _metric_samples("modulator_netbox_devices_by_auth").items()
+    )
+    by_module = sorted(
+        (dict(k).get("module", "?"), int(v)) for k, v in _metric_samples("modulator_netbox_devices_by_module").items()
+    )
+
+    _no_data = "<tr><td colspan=2>no data yet</td></tr>"
+    auth_rows = "".join(f"<tr><td>{p}</td><td>{n}</td></tr>" for p, n in by_auth) or _no_data
+    module_rows = "".join(f"<tr><td>{m}</td><td>{n}</td></tr>" for m, n in by_module) or _no_data
+    inflight_rows = "".join(f"<tr><td>{k}</td></tr>" for k in in_flight) or "<tr><td>none</td></tr>"
+
+    mode_badge = (
+        '<span class="badge" style="background:#e67e22">DRY RUN</span>'
+        if _DRY_RUN else '<span class="badge" style="background:#2ecc71">live</span>'
+    )
+    refresh_str = f"{_NETBOX_REFRESH_INTERVAL}s" if _NETBOX_REFRESH_INTERVAL > 0 else "disabled"
+
+    return f"""<!doctype html><html><head><meta charset=utf-8>
+<title>snmp-modulator</title>
+<style>
+  body {{ font-family: monospace; max-width: 860px; margin: 2em auto; padding: 0 1em;
+          background: #1a1a2e; color: #eee; }}
+  h1 {{ color: #a29bfe; }}
+  h2 {{ color: #74b9ff; border-bottom: 1px solid #444; padding-bottom: .3em; }}
+  .badge {{ display:inline-block; padding: .2em .7em; border-radius: 4px; font-weight: bold; color: #fff; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th, td {{ text-align: left; padding: .4em .8em; border-bottom: 1px solid #333; }}
+  th {{ color: #a29bfe; }}
+  .endpoints td:first-child {{ color: #55efc4; }}
+  .endpoints td:nth-child(2) {{ color: #fdcb6e; }}
+  a {{ color: #74b9ff; }}
+</style></head><body>
+<h1>snmp-modulator</h1>
+<p>Mode: {mode_badge}
+&nbsp; Probes in progress: <b>{int(_metric_value("modulator_probe_in_progress"))}</b>
+&nbsp; Jobs in flight: <b>{int(_metric_value("modulator_probe_jobs_in_flight"))}</b>
+&nbsp; Max concurrent: <b>{_MAX_CONCURRENT}</b>
+&nbsp; Device parallelism: <b>{_DEVICE_PARALLELISM}</b>
+&nbsp; NetBox refresh: <b>{refresh_str}</b></p>
+
+<h2>Endpoints</h2>
+<table class="endpoints">
+  <tr><th>Method</th><th>Path</th><th>Description</th></tr>
+  <tr><td>GET/POST</td><td>/probe</td><td>Probe a single device by IP or name</td></tr>
+  <tr><td>GET/POST</td><td>/probe/netbox</td><td>Probe devices matching a NetBox filter</td></tr>
+  <tr><td>GET</td><td><a href={_METRICS_PATH}>{_METRICS_PATH}</a></td><td>Prometheus metrics</td></tr>
+  <tr><td>GET</td><td><a href=/health>/health</a></td><td>Liveness check</td></tr>
+  <tr><td>GET</td><td><a href=/docs>/docs</a></td><td>Swagger UI</td></tr>
+</table>
+
+<h2>In-flight jobs ({len(in_flight)})</h2>
+<table>{inflight_rows}</table>
+
+<h2>Devices by auth profile</h2>
+<table><tr><th>Profile</th><th>Count</th></tr>{auth_rows}</table>
+
+<h2>Devices by module</h2>
+<table><tr><th>Module</th><th>Count</th></tr>{module_rows}</table>
+</body></html>"""
 
 
 @app.get("/health", summary="Liveness check")
