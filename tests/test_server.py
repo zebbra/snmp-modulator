@@ -192,6 +192,14 @@ def test_index_lists_in_flight_jobs_and_device_counts() -> None:
     assert "if_mib" in html
 
 
+def test_index_shows_pod_wide_max_concurrent(monkeypatch) -> None:
+    monkeypatch.setattr(server, "_MAX_CONCURRENT", 2)
+    monkeypatch.setattr(server, "_WORKERS", 4)
+    html = asyncio.run(server.index())
+    assert "pod-wide across 4 workers" in html
+    assert "<b>8</b> pod-wide" in html
+
+
 def test_index_shows_module_mismatch_when_present() -> None:
     with server._module_mismatch_lock:
         server._module_mismatch["only_in_netbox"] = ["stale_module"]

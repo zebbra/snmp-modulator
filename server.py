@@ -228,6 +228,7 @@ _DRY_RUN:       bool = _flag("MODULATOR_DRY_RUN")
 _MAPPING_FILE:  str  = os.getenv("MAPPING_FILE", "mapping.yaml")
 _MAX_CONCURRENT: int           = int(os.getenv("MODULATOR_MAX_CONCURRENT_RUNS", "1"))
 _DEVICE_PARALLELISM: int       = int(os.getenv("MODULATOR_DEVICE_PARALLELISM", "1"))
+_WORKERS: int                  = int(os.getenv("MODULATOR_WORKERS", "4"))
 _NETBOX_REFRESH_INTERVAL: int = int(os.getenv("MODULATOR_NETBOX_REFRESH_INTERVAL", "3600"))
 
 # pynetbox filter keys: alphanumeric + underscore (allowing pynetbox's __operator suffix style).
@@ -592,7 +593,8 @@ async def index() -> str:
 <p>Mode: {mode_badge}
 &nbsp; Probes in progress: <b>{int(_metric_value("modulator_probe_in_progress"))}</b>
 &nbsp; Jobs in flight: <b>{int(_metric_value("modulator_probe_jobs_in_flight"))}</b>
-&nbsp; Max concurrent: <b>{_MAX_CONCURRENT}</b>
+&nbsp; Max concurrent: <b>{_MAX_CONCURRENT}</b> per worker
+(<b>{_MAX_CONCURRENT * _WORKERS}</b> pod-wide across {_WORKERS} workers)
 &nbsp; Device parallelism: <b>{_DEVICE_PARALLELISM}</b>
 &nbsp; NetBox refresh: <b>{refresh_str}</b></p>
 
@@ -640,13 +642,12 @@ async def health() -> dict:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    port    = int(os.getenv("MODULATOR_PORT", "8081"))
-    workers = int(os.getenv("MODULATOR_WORKERS", "4"))
-    logger.info("snmp-modulator server starting on port %d (%d workers)", port, workers)
+    port = int(os.getenv("MODULATOR_PORT", "8081"))
+    logger.info("snmp-modulator server starting on port %d (%d workers)", port, _WORKERS)
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
         port=port,
-        workers=workers,
+        workers=_WORKERS,
         log_config=_UVICORN_LOG_CONFIG,
     )
