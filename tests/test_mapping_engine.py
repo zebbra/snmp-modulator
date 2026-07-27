@@ -6,6 +6,7 @@ Run with `pytest tests/` or directly:
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ import pytest
 from modulator import (
     DeviceInfo,
     MappingEngine,
+    _current_duration_or_default,
     _format_duration,
     _parse_duration,
     _round_up_to_step,
@@ -245,6 +247,24 @@ def test_parse_duration_variants() -> None:
     assert _parse_duration("30s") == 30
     assert _parse_duration("2m") == 120
     assert _parse_duration("90") == 90
+    assert _parse_duration("1h") == 3600
+
+
+def test_current_duration_or_default_falls_back_on_unparseable_legacy_value(caplog) -> None:
+    log = logging.getLogger("test")
+    with caplog.at_level(logging.WARNING):
+        assert _current_duration_or_default("garbage", 120, "polling interval", log) == 120
+    assert "garbage" in caplog.text
+
+
+def test_current_duration_or_default_parses_valid_value() -> None:
+    log = logging.getLogger("test")
+    assert _current_duration_or_default("1h", 120, "polling timeout", log) == 3600
+
+
+def test_current_duration_or_default_uses_default_when_unset() -> None:
+    log = logging.getLogger("test")
+    assert _current_duration_or_default(None, 120, "polling timeout", log) == 120
 
 
 def test_format_duration_prefers_minutes_when_exact() -> None:

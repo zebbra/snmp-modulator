@@ -275,5 +275,46 @@ def test_canary_failure_skips_remaining_module_probes(tmp_path) -> None:
     assert nb.module_updates == []
 
 
+# ── stale/unparseable existing polling field must not abort the device ────────
+
+MAPPING_POLLING = """
+auth:
+  policy: use
+modules:
+  policy: drop
+  interval_field: snmp_polling_interval
+  timeout_field: snmp_polling_timeout
+defaults:
+  modules:
+    try: [if_mib]
+"""
+
+
+def test_process_device_survives_stale_unparseable_polling_field(tmp_path) -> None:
+    # Regression: a device whose snmp_polling_interval custom field holds a
+    # legacy value ("1h") no longer in the NetBox choice set used to blow up
+    # _parse_duration and abort the whole device — silently discarding an
+    # otherwise-valid module update.
+    engine = _engine(tmp_path, MAPPING_POLLING)
+    nb = FakeNetboxClient()
+    nb.get_polling_step_values = lambda field_name: [30, 60, 120, 180, 300]
+
+    snmp = FakeSnmpExporterClient(
+        modules=["if_mib"],
+        auths=[],
+        probe_results={
+            "if_mib": ModuleTestResult(module="if_mib", useful=True, metric_count=5, duration_seconds=1.0),
+        },
+    )
+    mod = Modulator(nb, snmp, engine, module_policy="drop")
+    dev = _device(current_modules=[], snmp_auth_profile="public_v2", polling_interval="1h")
+    result = mod.process_device(dev)
+
+    assert result.error is None
+    assert result.changed is True
+    assert result.final_modules == ["if_mib"]
+    assert nb.module_updates == [(1, ["if_mib"], [], [])]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

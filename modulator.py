@@ -32,8 +32,10 @@ AUTH_POLICIES     = ("use", "try", "drop")
 
 
 def _parse_duration(s: str) -> int:
-    """Parse '30s', '1m', '90s', '3m' etc. to seconds."""
+    """Parse '30s', '1m', '90s', '3m', '1h' etc. to seconds."""
     s = s.strip()
+    if s.endswith("h"):
+        return int(s[:-1]) * 3600
     if s.endswith("m"):
         return int(s[:-1]) * 60
     if s.endswith("s"):
@@ -46,6 +48,19 @@ def _format_duration(seconds: int) -> str:
     if seconds % 60 == 0:
         return f"{seconds // 60}m"
     return f"{seconds}s"
+
+
+def _current_duration_or_default(value: Optional[str], default: int, label: str, log) -> int:
+    """Parse a device's existing polling field, falling back to `default` (with a
+    warning) if it holds a stale/unparseable value — e.g. an hour-scale value left
+    over from before a NetBox choice set was tightened to only allow smaller steps."""
+    if not value:
+        return default
+    try:
+        return _parse_duration(value)
+    except (ValueError, AttributeError):
+        log.warning("Existing %s %r is not parseable — using default (%ds)", label, value, default)
+        return default
 
 
 def _round_up_to_step(seconds: float, steps: list) -> int:
@@ -1163,12 +1178,11 @@ class Modulator:
                 rec_timeout_s  = _round_up_to_step(total_s * 1.5, self._timeout_steps)
                 rec_interval_s = _round_up_to_step(rec_timeout_s * 2, self._interval_steps)
 
-                cur_timeout_s = (
-                    _parse_duration(device.polling_timeout) if device.polling_timeout else self.engine.default_timeout
+                cur_timeout_s = _current_duration_or_default(
+                    device.polling_timeout, self.engine.default_timeout, "polling timeout", log
                 )
-                cur_interval_s = (
-                    _parse_duration(device.polling_interval) if device.polling_interval
-                    else self.engine.default_interval
+                cur_interval_s = _current_duration_or_default(
+                    device.polling_interval, self.engine.default_interval, "polling interval", log
                 )
                 if rec_timeout_s  > cur_timeout_s:
                     new_timeout  = _format_duration(rec_timeout_s)
