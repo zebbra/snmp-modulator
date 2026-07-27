@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import date
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -90,6 +91,78 @@ def test_get_devices_skips_devices_without_primary_ip() -> None:
     client = _client(devices)
     result = client.get_devices()
     assert [d.name for d in result] == ["sw1"]
+
+
+# ── touch_field: written on real changes, left alone otherwise ────────────────
+
+class RecordingDevice:
+    def __init__(self, id, tags=()):
+        self.id = id
+        self.tags = list(tags)
+        self.updates: list = []
+
+    def update(self, payload):
+        self.updates.append(payload)
+
+
+def _client_for_writes(device, touch_field=None) -> NetboxClient:
+    client = NetboxClient.__new__(NetboxClient)
+    client.nb = SimpleNamespace(
+        dcim=SimpleNamespace(devices=SimpleNamespace(get=lambda id: device)),
+        extras=SimpleNamespace(tags=SimpleNamespace(get=lambda slug: SimpleNamespace(id=99, slug=slug))),
+    )
+    client._module_field   = "snmp_exporter_module"
+    client._auth_field      = "snmp_auth_profile"
+    client._interval_field  = "snmp_polling_interval"
+    client._timeout_field   = "snmp_polling_timeout"
+    client._touch_field     = touch_field
+    client._valid_modules   = None
+    return client
+
+
+def test_update_snmp_modules_touches_when_configured() -> None:
+    dev = RecordingDevice(1)
+    client = _client_for_writes(dev, touch_field="snmp_modulator_last_updated")
+    client.update_snmp_modules(1, ["if_mib"])
+    assert dev.updates[0]["custom_fields"]["snmp_modulator_last_updated"] == date.today().isoformat()
+
+
+def test_update_snmp_modules_no_touch_when_disabled() -> None:
+    dev = RecordingDevice(1)
+    client = _client_for_writes(dev, touch_field=None)
+    client.update_snmp_modules(1, ["if_mib"])
+    assert "snmp_modulator_last_updated" not in dev.updates[0]["custom_fields"]
+
+
+def test_update_auth_profile_touches_when_configured() -> None:
+    dev = RecordingDevice(1)
+    client = _client_for_writes(dev, touch_field="snmp_modulator_last_updated")
+    client.update_auth_profile(1, "public_v2")
+    assert dev.updates[0]["custom_fields"]["snmp_modulator_last_updated"] == date.today().isoformat()
+
+
+def test_apply_tag_changes_touches_when_configured() -> None:
+    dev = RecordingDevice(1)
+    client = _client_for_writes(dev, touch_field="snmp_modulator_last_updated")
+    client.apply_tag_changes(1, ["fixme-snmp"], [])
+    assert dev.updates[0]["custom_fields"]["snmp_modulator_last_updated"] == date.today().isoformat()
+    assert "tags" in dev.updates[0]
+
+
+def test_update_polling_not_touched_when_nothing_changes() -> None:
+    # Regression: touch_field must reflect real changes only — a no-op polling
+    # call (both interval and timeout None) must not write anything at all.
+    dev = RecordingDevice(1)
+    client = _client_for_writes(dev, touch_field="snmp_modulator_last_updated")
+    client.update_polling(1)
+    assert dev.updates == []
+
+
+def test_update_polling_touches_when_value_changes() -> None:
+    dev = RecordingDevice(1)
+    client = _client_for_writes(dev, touch_field="snmp_modulator_last_updated")
+    client.update_polling(1, interval="5m")
+    assert dev.updates[0]["custom_fields"]["snmp_modulator_last_updated"] == date.today().isoformat()
 
 
 if __name__ == "__main__":

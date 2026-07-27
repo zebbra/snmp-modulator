@@ -56,11 +56,13 @@ probing a canary module and checking `up=1`. Written back to `snmp_auth_profile`
 | `snmp_auth_profile` | text | yes | read + **write** (when auth probing resolves a different profile) |
 | `snmp_polling_interval` | selection | no | read + **write** — Prometheus scrape interval; choice set provides the step ladder |
 | `snmp_polling_timeout` | selection | no | read + **write** — Prometheus scrape timeout; choice set provides the step ladder |
+| `snmp_modulator_last_updated` | date | no | **write** — set to today whenever a device is actually changed; untouched on no-op runs |
 
 The two mandatory fields must exist on all devices the modulator processes. Field names are configurable in `mapping.yaml` (`modules.field`, `auth.field`) and can be overridden per-run via CLI.
 
 Optional fields are only written when enabled in `mapping.yaml`:
 - `snmp_polling_*` — only when `modules.interval_field` / `modules.timeout_field` are set; omit both to measure and log durations without writing
+- `snmp_modulator_last_updated` (or whatever `touch_field` names) — set/omit `touch_field` to enable/disable; must exist as a NetBox custom field on `dcim.device` before enabling
 
 ---
 
@@ -71,6 +73,8 @@ All probe behaviour is controlled by `mapping.yaml`.
 ### Global Settings
 
 ```yaml
+touch_field: snmp_modulator_last_updated  # date field set on any real change; omit/empty to disable
+
 modules:
   field:  snmp_exporter_module  # NetBox multi-select custom field
   policy: drop                  # use | try | drop
@@ -374,7 +378,7 @@ Tag changes are batched with the module write when modules changed — one API c
 | `MODULATOR_WORKERS` | `4` | uvicorn worker count |
 | `MODULATOR_MAX_CONCURRENT_RUNS` | `1` | Max simultaneous probe jobs (per worker) |
 | `MODULATOR_DEVICE_PARALLELISM` | `1` | Devices probed concurrently within a single run (1 = sequential). SNMP probing is I/O-bound, so 10–20 is usually a safe sweet spot |
-| `MODULATOR_NETBOX_REFRESH_INTERVAL` | `600` | Seconds between NetBox device-count gauge refreshes (set `0` to disable) |
+| `MODULATOR_NETBOX_REFRESH_INTERVAL` | `3600` | Seconds between NetBox device-count gauge refreshes (set `0` to disable) |
 | `PROMETHEUS_MULTIPROC_DIR` | auto | Multiprocess Prometheus metrics directory. Auto-set to `/tmp/modulator_metrics` when `MODULATOR_WORKERS>1`; set explicitly to override |
 | `MODULATOR_METRICS_PATH` | `/metrics` | Prometheus metrics endpoint path |
 

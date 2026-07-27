@@ -11,6 +11,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, Optional
 
 import pynetbox
@@ -69,6 +70,17 @@ def _round_up_to_step(seconds: float, steps: list) -> int:
         if step >= seconds:
             return step
     return steps[-1]
+
+
+def compare_module_sets(nb_valid_modules: Optional[frozenset], snmp_modules: set) -> tuple:
+    """Diff NetBox's module choice set against snmp-exporter's known modules.
+
+    Returns (only_in_netbox, only_in_snmp) sorted lists — empty on either side
+    when one of the two sources isn't available yet.
+    """
+    if not nb_valid_modules or not snmp_modules:
+        return [], []
+    return sorted(nb_valid_modules - snmp_modules), sorted(snmp_modules - nb_valid_modules)
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -138,6 +150,7 @@ class NetboxClient:
         auth_field: str = "snmp_auth_profile",
         interval_field: str = "snmp_polling_interval",
         timeout_field: str = "snmp_polling_timeout",
+        touch_field: Optional[str] = None,
     ):
         session = _ChangelogSession(APP_NAME)
         if not verify_tls:
@@ -149,6 +162,7 @@ class NetboxClient:
         self._auth_field        = auth_field
         self._interval_field    = interval_field
         self._timeout_field     = timeout_field
+        self._touch_field       = touch_field
         self._valid_modules: Optional[frozenset] = self._fetch_module_choices()
 
     def _fetch_module_choices(self) -> Optional[frozenset]:
@@ -334,6 +348,8 @@ class NetboxClient:
             cf[self._interval_field] = polling_interval
         if polling_timeout is not None:
             cf[self._timeout_field] = polling_timeout
+        if self._touch_field:
+            cf[self._touch_field] = date.today().isoformat()
         payload = {"custom_fields": cf}
         if add_tags or remove_tags:
             payload["tags"] = self._compute_tags(dev, add_tags, remove_tags)
@@ -349,18 +365,26 @@ class NetboxClient:
         if timeout is not None:
             cf[self._timeout_field] = timeout
         if cf:
+            if self._touch_field:
+                cf[self._touch_field] = date.today().isoformat()
             dev = self.nb.dcim.devices.get(device_id)
             dev.update({"custom_fields": cf})
 
     def update_auth_profile(self, device_id: int, profile: str) -> None:
         """Update the SNMP auth profile text custom field."""
+        cf = {self._auth_field: profile}
+        if self._touch_field:
+            cf[self._touch_field] = date.today().isoformat()
         dev = self.nb.dcim.devices.get(device_id)
-        dev.update({"custom_fields": {self._auth_field: profile}})
+        dev.update({"custom_fields": cf})
 
     def apply_tag_changes(self, device_id: int, add_tags: list, remove_tags: list) -> None:
         """Add/remove tags on a device (standalone, when no module update is needed)."""
         dev = self.nb.dcim.devices.get(device_id)
-        dev.update({"tags": self._compute_tags(dev, add_tags, remove_tags)})
+        payload = {"tags": self._compute_tags(dev, add_tags, remove_tags)}
+        if self._touch_field:
+            payload["custom_fields"] = {self._touch_field: date.today().isoformat()}
+        dev.update(payload)
 
     def _compute_tags(self, dev, add_slugs: list, remove_slugs: list) -> list:
         """Compute the new tag list given slugs to add and remove."""
@@ -577,6 +601,10 @@ class MappingEngine:
         self.auth_field:       str = auth_cfg.get("field",              "snmp_auth_profile")
         self.interval_field:   Optional[str] = modules_cfg.get("interval_field")  or None
         self.timeout_field:    Optional[str] = modules_cfg.get("timeout_field")   or None
+        # Written with today's date whenever a device is actually changed (module,
+        # auth, tag, or polling field write) — never touched if nothing changed.
+        # Omit or set empty to disable.
+        self.touch_field:      Optional[str] = raw.get("touch_field", "snmp_modulator_last_updated") or None
         self.default_interval: int = _parse_duration(modules_cfg.get("default_interval", "3m"))
         self.default_timeout:  int = _parse_duration(modules_cfg.get("default_timeout",  "2m"))
 
@@ -619,7 +647,7 @@ class MappingEngine:
 
         logger.info(
             "Mapping loaded: %d rule(s)  defaults: add=%d try=%d block=%d  "
-            "module_policy=%s  auth_policy=%s  module_field=%r  auth_field=%r",
+            "module_policy=%s  auth_policy=%s  module_field=%r  auth_field=%r  touch_field=%r",
             len(self._rules),
             len(self._default_add),
             len(self._default_try),
@@ -628,6 +656,7 @@ class MappingEngine:
             self.auth_policy,
             self.module_field,
             self.auth_field,
+            self.touch_field,
         )
 
     @staticmethod
@@ -916,20 +945,15 @@ class Modulator:
 
     def _compare_module_sets(self) -> None:
         """Warn if NetBox module choices and snmp-exporter modules are out of sync."""
-        nb_choices = self.nb._valid_modules
-        if not nb_choices:
-            return
-        snmp_modules = set(self.snmp.modules)
-        if not snmp_modules:
-            return
-        only_in_netbox = nb_choices - snmp_modules
-        only_in_snmp   = snmp_modules - nb_choices
+        only_in_netbox, only_in_snmp = compare_module_sets(self.nb._valid_modules, set(self.snmp.modules))
         if only_in_netbox:
-            logger.warning("Module(s) in NetBox but not in snmp-exporter: %s", sorted(only_in_netbox))
+            logger.warning("Module(s) in NetBox but not in snmp-exporter: %s", only_in_netbox)
         if only_in_snmp:
-            logger.warning("Module(s) in snmp-exporter but not in NetBox: %s", sorted(only_in_snmp))
-        if not only_in_netbox and not only_in_snmp:
-            logger.debug("NetBox choices and snmp-exporter modules are in sync (%d)", len(nb_choices))
+            logger.warning("Module(s) in snmp-exporter but not in NetBox: %s", only_in_snmp)
+        if not only_in_netbox and not only_in_snmp and self.nb._valid_modules and self.snmp.modules:
+            logger.debug(
+                "NetBox choices and snmp-exporter modules are in sync (%d)", len(self.nb._valid_modules)
+            )
 
     def run(
         self,

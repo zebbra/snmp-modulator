@@ -22,6 +22,7 @@ from modulator import (
     _format_duration,
     _parse_duration,
     _round_up_to_step,
+    compare_module_sets,
 )
 
 
@@ -41,6 +42,23 @@ def _device(nb_device=None, current_modules=(), snmp_auth_profile="", **kw) -> D
         nb_device=nb_device if nb_device is not None else SimpleNamespace(),
         **kw,
     )
+
+
+# ── touch_field: defaults, override, disable ───────────────────────────────────
+
+def test_touch_field_defaults_when_omitted(tmp_path) -> None:
+    engine = _engine(tmp_path, "modules:\n  policy: drop\n")
+    assert engine.touch_field == "snmp_modulator_last_updated"
+
+
+def test_touch_field_honors_explicit_override(tmp_path) -> None:
+    engine = _engine(tmp_path, "touch_field: my_custom_field\nmodules:\n  policy: drop\n")
+    assert engine.touch_field == "my_custom_field"
+
+
+def test_touch_field_disabled_when_set_empty(tmp_path) -> None:
+    engine = _engine(tmp_path, 'touch_field: ""\nmodules:\n  policy: drop\n')
+    assert engine.touch_field is None
 
 
 # ── evaluate(): defaults + rule accumulation ───────────────────────────────────
@@ -284,6 +302,28 @@ def test_round_up_to_step_exact_match_returns_the_step() -> None:
 
 def test_round_up_to_step_caps_at_max_step() -> None:
     assert _round_up_to_step(999.0, [30, 60, 120]) == 120
+
+
+# ── compare_module_sets ─────────────────────────────────────────────────────────
+
+def test_compare_module_sets_finds_both_directions() -> None:
+    only_netbox, only_snmp = compare_module_sets(
+        frozenset({"if_mib", "cisco_generic", "stale_module"}),
+        {"if_mib", "cisco_generic", "new_module"},
+    )
+    assert only_netbox == ["stale_module"]
+    assert only_snmp == ["new_module"]
+
+
+def test_compare_module_sets_in_sync_returns_empty() -> None:
+    only_netbox, only_snmp = compare_module_sets(frozenset({"if_mib"}), {"if_mib"})
+    assert only_netbox == []
+    assert only_snmp == []
+
+
+def test_compare_module_sets_empty_when_either_side_missing() -> None:
+    assert compare_module_sets(None, {"if_mib"}) == ([], [])
+    assert compare_module_sets(frozenset({"if_mib"}), set()) == ([], [])
 
 
 if __name__ == "__main__":

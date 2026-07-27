@@ -67,7 +67,10 @@ def test_refresh_device_counts_sets_gauges_per_profile_and_module(monkeypatch) -
         calls.append(kwargs)
         return 3
 
-    fake_nb = SimpleNamespace(nb=SimpleNamespace(dcim=SimpleNamespace(devices=SimpleNamespace(count=fake_count))))
+    fake_nb = SimpleNamespace(
+        nb=SimpleNamespace(dcim=SimpleNamespace(devices=SimpleNamespace(count=fake_count))),
+        _valid_modules=frozenset({"if_mib"}),
+    )
     fake_snmp = SimpleNamespace(auths=["public_v2"], modules=["if_mib"])
     fake_engine = SimpleNamespace(auth_field="snmp_auth_profile", module_field="snmp_exporter_module")
 
@@ -78,6 +81,22 @@ def test_refresh_device_counts_sets_gauges_per_profile_and_module(monkeypatch) -
     assert server.netbox_devices_by_module.labels(module="if_mib")._value.get() == 3
     assert {"cf_snmp_auth_profile": "public_v2"} in calls
     assert {"cf_snmp_exporter_module": "if_mib"} in calls
+
+
+def test_refresh_device_counts_populates_module_mismatch(monkeypatch) -> None:
+    fake_nb = SimpleNamespace(
+        nb=SimpleNamespace(dcim=SimpleNamespace(devices=SimpleNamespace(count=lambda **kw: 0))),
+        _valid_modules=frozenset({"if_mib", "stale_module"}),
+    )
+    fake_snmp = SimpleNamespace(auths=[], modules=["if_mib", "new_module"])
+    fake_engine = SimpleNamespace(auth_field="snmp_auth_profile", module_field="snmp_exporter_module")
+
+    monkeypatch.setattr(server, "_make_clients", lambda: (fake_nb, fake_snmp, fake_engine, "drop"))
+    server._refresh_device_counts()
+
+    with server._module_mismatch_lock:
+        assert server._module_mismatch["only_in_netbox"] == ["stale_module"]
+        assert server._module_mismatch["only_in_snmp"]   == ["new_module"]
 
 
 # ── _run_probe: semaphore + in-flight bookkeeping ───────────────────────────────
@@ -138,6 +157,30 @@ def test_index_lists_in_flight_jobs_and_device_counts() -> None:
     assert "host:10.0.0.1" in html
     assert "public_v2" in html
     assert "if_mib" in html
+
+
+def test_index_shows_module_mismatch_when_present() -> None:
+    with server._module_mismatch_lock:
+        server._module_mismatch["only_in_netbox"] = ["stale_module"]
+        server._module_mismatch["only_in_snmp"]   = ["new_module"]
+    try:
+        html = asyncio.run(server.index())
+    finally:
+        with server._module_mismatch_lock:
+            server._module_mismatch["only_in_netbox"] = []
+            server._module_mismatch["only_in_snmp"]   = []
+
+    assert "stale_module" in html
+    assert "new_module" in html
+    assert "mismatch" in html
+
+
+def test_index_shows_in_sync_when_no_mismatch() -> None:
+    with server._module_mismatch_lock:
+        server._module_mismatch["only_in_netbox"] = []
+        server._module_mismatch["only_in_snmp"]   = []
+    html = asyncio.run(server.index())
+    assert "in sync" in html
 
 
 if __name__ == "__main__":

@@ -62,7 +62,7 @@ from prometheus_client import (
 )
 from prometheus_client.multiprocess import MultiProcessCollector
 
-from modulator import Callbacks, MappingEngine, Modulator, NetboxClient, SnmpExporterClient
+from modulator import Callbacks, MappingEngine, Modulator, NetboxClient, SnmpExporterClient, compare_module_sets
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -228,7 +228,7 @@ _DRY_RUN:       bool = _flag("MODULATOR_DRY_RUN")
 _MAPPING_FILE:  str  = os.getenv("MAPPING_FILE", "mapping.yaml")
 _MAX_CONCURRENT: int           = int(os.getenv("MODULATOR_MAX_CONCURRENT_RUNS", "1"))
 _DEVICE_PARALLELISM: int       = int(os.getenv("MODULATOR_DEVICE_PARALLELISM", "1"))
-_NETBOX_REFRESH_INTERVAL: int = int(os.getenv("MODULATOR_NETBOX_REFRESH_INTERVAL", "600"))
+_NETBOX_REFRESH_INTERVAL: int = int(os.getenv("MODULATOR_NETBOX_REFRESH_INTERVAL", "3600"))
 
 # pynetbox filter keys: alphanumeric + underscore (allowing pynetbox's __operator suffix style).
 # Anything else (slashes, question marks, dots, etc.) is rejected before reaching NetBox.
@@ -264,6 +264,10 @@ app = FastAPI(
 _in_flight: set = set()
 _in_flight_lock = threading.Lock()
 
+# NetBox module choices vs snmp-exporter modules — refreshed alongside device counts
+_module_mismatch_lock = threading.Lock()
+_module_mismatch: dict = {"only_in_netbox": [], "only_in_snmp": []}
+
 _probe_semaphore = threading.Semaphore(_MAX_CONCURRENT)
 
 
@@ -280,6 +284,7 @@ def _make_clients():
         auth_field=engine.auth_field,
         interval_field=engine.interval_field,
         timeout_field=engine.timeout_field,
+        touch_field=engine.touch_field,
     )
     verify_tls = os.getenv("SNMP_EXPORTER_TLS_VERIFY", "true").lower() != "false"
     timeout    = int(os.getenv("SNMP_EXPORTER_TIMEOUT", "30"))
@@ -303,6 +308,15 @@ def _refresh_device_counts() -> None:
     if not snmp.auths and not snmp.modules:
         logger.warning("NetBox device counts: snmp-exporter /config returned no auths/modules — skipping")
         return
+
+    only_in_netbox, only_in_snmp = compare_module_sets(nb._valid_modules, set(snmp.modules))
+    with _module_mismatch_lock:
+        _module_mismatch["only_in_netbox"] = only_in_netbox
+        _module_mismatch["only_in_snmp"]   = only_in_snmp
+    if only_in_netbox:
+        logger.warning("Module(s) in NetBox but not in snmp-exporter: %s", only_in_netbox)
+    if only_in_snmp:
+        logger.warning("Module(s) in snmp-exporter but not in NetBox: %s", only_in_snmp)
 
     auth_ok = mod_ok = 0
     for profile in snmp.auths:
@@ -497,25 +511,40 @@ async def index() -> str:
     inflight_rows = "".join(f"<tr><td>{k}</td></tr>" for k in in_flight) or "<tr><td>none</td></tr>"
 
     mode_badge = (
-        '<span class="badge" style="background:#e67e22">DRY RUN</span>'
-        if _DRY_RUN else '<span class="badge" style="background:#2ecc71">live</span>'
+        '<span class="badge" style="background:#B8722B">DRY RUN</span>'
+        if _DRY_RUN else '<span class="badge" style="background:#1D9E75">live</span>'
     )
     refresh_str = f"{_NETBOX_REFRESH_INTERVAL}s" if _NETBOX_REFRESH_INTERVAL > 0 else "disabled"
 
+    with _module_mismatch_lock:
+        only_in_netbox = list(_module_mismatch["only_in_netbox"])
+        only_in_snmp   = list(_module_mismatch["only_in_snmp"])
+    if only_in_netbox or only_in_snmp:
+        mismatch_badge = '<span class="badge" style="background:#B8722B">mismatch</span>'
+        mismatch_rows = (
+            f"<tr><td>In NetBox, not in snmp-exporter</td><td>{', '.join(only_in_netbox) or '-'}</td></tr>"
+            f"<tr><td>In snmp-exporter, not in NetBox</td><td>{', '.join(only_in_snmp) or '-'}</td></tr>"
+        )
+    else:
+        mismatch_badge = '<span class="badge" style="background:#1D9E75">in sync</span>'
+        mismatch_rows = ""
+
+    # Palette matches banner.svg (teal-green on near-black) — kept distinct from
+    # discobox's purple/blue-on-navy dashboard.
     return f"""<!doctype html><html><head><meta charset=utf-8>
 <title>snmp-modulator</title>
 <style>
   body {{ font-family: monospace; max-width: 860px; margin: 2em auto; padding: 0 1em;
-          background: #1a1a2e; color: #eee; }}
-  h1 {{ color: #a29bfe; }}
-  h2 {{ color: #74b9ff; border-bottom: 1px solid #444; padding-bottom: .3em; }}
+          background: #0C0D10; color: #cfe8df; }}
+  h1 {{ color: #5DCAA5; }}
+  h2 {{ color: #9FE1CB; border-bottom: 1px solid #1a1d24; padding-bottom: .3em; }}
   .badge {{ display:inline-block; padding: .2em .7em; border-radius: 4px; font-weight: bold; color: #fff; }}
   table {{ border-collapse: collapse; width: 100%; }}
-  th, td {{ text-align: left; padding: .4em .8em; border-bottom: 1px solid #333; }}
-  th {{ color: #a29bfe; }}
-  .endpoints td:first-child {{ color: #55efc4; }}
-  .endpoints td:nth-child(2) {{ color: #fdcb6e; }}
-  a {{ color: #74b9ff; }}
+  th, td {{ text-align: left; padding: .4em .8em; border-bottom: 1px solid #1a1d24; }}
+  th {{ color: #5DCAA5; }}
+  .endpoints td:first-child {{ color: #5DCAA5; }}
+  .endpoints td:nth-child(2) {{ color: #9FE1CB; }}
+  a {{ color: #5DCAA5; }}
 </style></head><body>
 <h1>snmp-modulator</h1>
 <p>Mode: {mode_badge}
@@ -534,6 +563,14 @@ async def index() -> str:
   <tr><td>GET</td><td><a href=/health>/health</a></td><td>Liveness check</td></tr>
   <tr><td>GET</td><td><a href=/docs>/docs</a></td><td>Swagger UI</td></tr>
 </table>
+<p>Examples (POST recommended; GET also triggers the probe, so these aren't links):</p>
+<ul>
+  <li><code>/probe?host=10.0.0.5</code></li>
+  <li><code>/probe?host=switch1.nms.admin.ch</code></li>
+  <li><code>/probe/netbox?role_id=4&amp;last_updated__lt=2025-10-01</code></li>
+  <li><code>/probe/netbox?site=dc1&amp;tag=snmp-ready</code></li>
+  <li><code>/probe/netbox?manufacturer=cisco</code></li>
+</ul>
 
 <h2>In-flight jobs ({len(in_flight)})</h2>
 <table>{inflight_rows}</table>
@@ -543,6 +580,9 @@ async def index() -> str:
 
 <h2>Devices by module</h2>
 <table><tr><th>Module</th><th>Count</th></tr>{module_rows}</table>
+
+<h2>Module mismatch {mismatch_badge}</h2>
+<table>{mismatch_rows or "<tr><td>NetBox module choices and snmp-exporter modules match</td></tr>"}</table>
 </body></html>"""
 
 
