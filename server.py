@@ -249,8 +249,14 @@ async def require_auth(authorization: Annotated[str, Header()] = "") -> None:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    _start_device_count_refresher()
+    is_device_count_leader = _acquire_device_count_leadership()
+    if is_device_count_leader:
+        _start_device_count_refresher()
+    else:
+        logger.info("NetBox device-count refresher not started: another worker already holds leadership")
     yield
+    if is_device_count_leader:
+        _release_device_count_leadership()
 
 
 app = FastAPI(
@@ -269,6 +275,42 @@ _module_mismatch_lock = threading.Lock()
 _module_mismatch: dict = {"only_in_netbox": [], "only_in_snmp": []}
 
 _probe_semaphore = threading.Semaphore(_MAX_CONCURRENT)
+
+# Device-count refresh leader election: with MODULATOR_WORKERS>1, _lifespan runs
+# once per worker process, so only one worker may run _device_count_loop() or
+# every refresh's NetBox/snmp-exporter query volume gets multiplied by the worker
+# count. PID-based lock file: a crashed leader (without a clean shutdown) doesn't
+# permanently wedge the refresh for the other workers.
+_DEVICE_COUNT_LEADER_FILE: str = os.path.join(_MULTIPROC_DIR or "/tmp", "modulator.device-count-leader.pid")
+
+
+def _acquire_device_count_leadership() -> bool:
+    for _ in range(2):
+        try:
+            fd = os.open(_DEVICE_COUNT_LEADER_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                with open(_DEVICE_COUNT_LEADER_FILE) as f:
+                    leader_pid = int(f.read().strip())
+                os.kill(leader_pid, 0)
+                return False  # leader still alive
+            except (OSError, ValueError):
+                pass  # stale lock (leader pid gone or file unreadable): reclaim it
+            try:
+                os.unlink(_DEVICE_COUNT_LEADER_FILE)
+            except FileNotFoundError:
+                pass
+    return False
+
+
+def _release_device_count_leadership() -> None:
+    try:
+        os.unlink(_DEVICE_COUNT_LEADER_FILE)
+    except FileNotFoundError:
+        pass
 
 
 def _make_clients():
@@ -572,6 +614,9 @@ async def index() -> str:
   <li><code>/probe/netbox?manufacturer=cisco</code></li>
 </ul>
 
+<h2>Module mismatch {mismatch_badge}</h2>
+<table>{mismatch_rows or "<tr><td>NetBox module choices and snmp-exporter modules match</td></tr>"}</table>
+
 <h2>In-flight jobs ({len(in_flight)})</h2>
 <table>{inflight_rows}</table>
 
@@ -580,9 +625,6 @@ async def index() -> str:
 
 <h2>Devices by module</h2>
 <table><tr><th>Module</th><th>Count</th></tr>{module_rows}</table>
-
-<h2>Module mismatch {mismatch_badge}</h2>
-<table>{mismatch_rows or "<tr><td>NetBox module choices and snmp-exporter modules match</td></tr>"}</table>
 </body></html>"""
 
 

@@ -99,6 +99,39 @@ def test_refresh_device_counts_populates_module_mismatch(monkeypatch) -> None:
         assert server._module_mismatch["only_in_snmp"]   == ["new_module"]
 
 
+# ── device-count refresh leader election ────────────────────────────────────────
+
+def test_acquire_device_count_leadership_succeeds_when_unclaimed() -> None:
+    server._release_device_count_leadership()
+    try:
+        assert server._acquire_device_count_leadership() is True
+        with open(server._DEVICE_COUNT_LEADER_FILE) as f:
+            assert f.read().strip() == str(os.getpid())
+    finally:
+        server._release_device_count_leadership()
+
+
+def test_acquire_device_count_leadership_fails_when_leader_alive() -> None:
+    server._release_device_count_leadership()
+    try:
+        assert server._acquire_device_count_leadership() is True
+        assert server._acquire_device_count_leadership() is False  # our own PID is alive
+    finally:
+        server._release_device_count_leadership()
+
+
+def test_acquire_device_count_leadership_reclaims_stale_lock() -> None:
+    server._release_device_count_leadership()
+    try:
+        with open(server._DEVICE_COUNT_LEADER_FILE, "w") as f:
+            f.write("999999999")  # PID that (almost certainly) doesn't exist
+        assert server._acquire_device_count_leadership() is True
+        with open(server._DEVICE_COUNT_LEADER_FILE) as f:
+            assert f.read().strip() == str(os.getpid())
+    finally:
+        server._release_device_count_leadership()
+
+
 # ── _run_probe: semaphore + in-flight bookkeeping ───────────────────────────────
 
 def test_run_probe_releases_semaphore_and_clears_in_flight(monkeypatch) -> None:
