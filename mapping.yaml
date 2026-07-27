@@ -1,5 +1,10 @@
 # snmp-modulator mapping — see README.md for full reference
 
+# Written with today's date whenever a device is actually changed (module, auth,
+# tag, or polling field write); never touched if a run leaves everything as-is.
+# Omit or set empty ("") to disable.
+touch_field: snmp_modulator_last_updated
+
 modules:
   field:            snmp_exporter_module
   policy:           drop      # use | try | drop
@@ -35,6 +40,10 @@ rules:
         - cisco_sensor
         - cisco_envmon
         - cisco_memory_pool
+        - entity
+        - entity_sensor
+        - entity_state
+        - host_ressources
 
   - name: "Cisco legacy slow devices"
     match:
@@ -67,9 +76,10 @@ rules:
       device_type.manufacturer.slug: "cisco"
       device_type.slug: "WS-C2960[^X].*"
     modules:
-      try: 
+      try:
         - cisco_memory_pool
         - cisco_nac
+        - cisco_process
 
   - name: "Cisco new-access (C9200, C9300)"
     match:
@@ -119,6 +129,7 @@ rules:
         - cisco_stackwise
         - cisco_virtual_switch
         - cisco_rf
+        - cisco_memory_pool
       try:
         - cisco_generic
         - cisco_sensor
@@ -133,6 +144,7 @@ rules:
         - if_full
       block:
         - cisco_stackwise
+        - cisco_memory_pool
       try:
         - cisco_generic
         - cisco_sensor
@@ -150,6 +162,7 @@ rules:
         - if_full
       block:
         - cisco_stackwise
+        - cisco_memory_pool
       try:
         - cisco_generic
         - cisco_sensor
@@ -200,6 +213,22 @@ rules:
     modules:
       try:
         - fortinet_fortigate
+
+  - name: "Fortinet FortiGate 6000/7000 series (by part number)"
+    match:
+      device_type.manufacturer.slug: "fortinet"
+      device_type.part_number: "FGT_?[67]\\d{3}[A-Z]?"
+    modules:
+      try:
+        - fortinet_fortigate_workerblade
+
+  - name: "Fortinet FortiGate 6000/7000 series (by slug)"
+    match:
+      device_type.manufacturer.slug: "fortinet"
+      device_type.slug: "fortinet-fortigate-[67]\\d{3}.*"
+    modules:
+      try:
+        - fortinet_fortigate_workerblade
 
   - name: "Fortinet FortiManager"
     match:
