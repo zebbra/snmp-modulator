@@ -1091,9 +1091,18 @@ class Modulator:
                 sorted(unconditional), sorted(test_set), sorted(block_set),
             )
 
-            # Probe each try-module using the resolved auth profile
+            # Probe each try-module using the resolved auth profile. Test the canary
+            # module first when it's in the set — the auth_candidates path already
+            # confirms reachability via probe_auth before we get here, but fixed_auth
+            # skips that, so without this a fully offline device would otherwise burn
+            # the full per-module timeout on every module before anything gives up.
             test_results: list = []
-            for module in sorted(test_set):
+            probe_order = sorted(test_set)
+            if canary_module in test_set:
+                probe_order.remove(canary_module)
+                probe_order.insert(0, canary_module)
+
+            for module in probe_order:
                 result = active_snmp.probe(device.primary_ip, module, resolved_auth)
                 test_results.append(result)
                 outcome = "error" if result.error else ("useful" if result.useful else "empty")
@@ -1105,6 +1114,14 @@ class Modulator:
                 )
                 callbacks.module_test(module=module, result=outcome)
                 callbacks.module_test_duration(module=module, duration=result.duration_seconds)
+
+                if module == canary_module and result.error:
+                    log.warning(
+                        "Reachability canary (%s) failed — device likely unreachable; "
+                        "skipping remaining %d module probe(s)",
+                        canary_module, len(probe_order) - 1,
+                    )
+                    break
 
             # Build final module set
             useful_modules = {r.module for r in test_results if r.useful}

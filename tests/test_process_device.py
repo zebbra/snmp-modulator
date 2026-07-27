@@ -230,5 +230,50 @@ def test_unreachable_guard_preserves_existing_modules_when_all_probes_useless(tm
     assert nb.module_updates == []
 
 
+# ── canary short-circuit ──────────────────────────────────────────────────────
+
+MAPPING_CANARY = """
+auth:
+  policy: use
+  probe_module: system
+modules:
+  policy: drop
+defaults:
+  modules:
+    try: [system, if_mib, cisco_generic]
+"""
+
+
+def test_canary_failure_skips_remaining_module_probes(tmp_path) -> None:
+    engine = _engine(tmp_path, MAPPING_CANARY)
+    nb = FakeNetboxClient()
+
+    probed: list = []
+
+    class TrackingSnmp(FakeSnmpExporterClient):
+        def probe(self, target, module, auth):
+            probed.append(module)
+            return super().probe(target, module, auth)
+
+    snmp = TrackingSnmp(
+        modules=["system", "if_mib", "cisco_generic"],
+        auths=[],
+        probe_results={
+            "system": ModuleTestResult(
+                module="system", useful=False, metric_count=0, duration_seconds=30.0,
+                error="Read timed out",
+            ),
+        },
+    )
+    mod = Modulator(nb, snmp, engine, module_policy="drop")
+    dev = _device(current_modules=["if_mib"], snmp_auth_profile="public_v2")
+    result = mod.process_device(dev)
+
+    assert probed == ["system"]  # if_mib/cisco_generic never probed once the canary failed
+    assert result.unreachable is True
+    assert result.final_modules == ["if_mib"]
+    assert nb.module_updates == []
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
