@@ -797,8 +797,8 @@ async def index() -> str:
   <tr><th>Method</th><th>Path</th><th>Description</th></tr>
   <tr><td>GET/POST</td><td>/probe</td><td>Probe a single device by IP or name</td></tr>
   <tr><td>GET/POST</td><td>/probe/netbox</td><td>Probe devices matching a NetBox filter</td></tr>
-  <tr><td>GET</td><td><a href=/rules>/rules</a></td>
-      <td>Loaded mapping.yaml rules (JSON; add <code>?format=html</code>)</td></tr>
+  <tr><td>GET</td><td><a href=/rules?format=html>/rules</a></td>
+      <td>Loaded mapping.yaml rules (JSON by default; link goes to <code>?format=html</code>)</td></tr>
   <tr><td>GET</td><td><a href=/stats>/stats</a></td>
       <td>Device counts by auth/module + module mismatch, as JSON</td></tr>
   <tr><td>GET</td><td><a href={_METRICS_PATH}>{_METRICS_PATH}</a></td><td>Prometheus metrics</td></tr>
@@ -870,7 +870,7 @@ async def health() -> dict:
 
 if __name__ == "__main__":
     port = int(os.getenv("MODULATOR_PORT", "8081"))
-    logger.info("snmp-modulator server starting on port %d (%d workers)", port, _WORKERS)
+    logger.info("snmp-modulator v%s starting on port %d (%d workers)", __version__, port, _WORKERS)
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
