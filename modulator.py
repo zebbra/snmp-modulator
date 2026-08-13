@@ -669,6 +669,41 @@ class MappingEngine:
             for field_path, pattern in match_dict.items()
         }
 
+    def snapshot(self) -> dict:
+        """JSON-serializable view of the loaded mapping — config, defaults, and
+        rules (compiled regex patterns rendered back to their source strings)."""
+        return {
+            "module_field":    self.module_field,
+            "auth_field":      self.auth_field,
+            "interval_field":  self.interval_field,
+            "timeout_field":   self.timeout_field,
+            "touch_field":     self.touch_field,
+            "default_interval": _format_duration(self.default_interval),
+            "default_timeout":  _format_duration(self.default_timeout),
+            "module_policy":    self.module_policy,
+            "auth_policy":      self.auth_policy,
+            "auth_probe_module": self.auth_probe_module,
+            "defaults": {
+                "modules": {
+                    "add":   list(self._default_add),
+                    "try":   list(self._default_try),
+                    "block": list(self._default_block),
+                },
+                "auth": {"try": list(self._default_auth_try)},
+            },
+            "rules": [
+                {
+                    "name":  rule["name"],
+                    "match": {field: pattern.pattern for field, pattern in rule["compiled_match"].items()},
+                    "modules": {"add": rule["add"], "try": rule["try"], "block": rule["block"]},
+                    "auth":       rule["auth"],
+                    "on_success": rule["on_success"],
+                    "on_fail":    rule["on_fail"],
+                }
+                for rule in self._rules
+            ],
+        }
+
     def evaluate(self, device: DeviceInfo, known_modules: list = ()) -> tuple:
         """
         Returns (unconditional_set, test_set, block_set, matched_rule_names, matched_rules).

@@ -288,5 +288,116 @@ def test_index_shows_in_sync_when_no_mismatch() -> None:
     assert "in sync" in html
 
 
+# ── /rules ───────────────────────────────────────────────────────────────────
+
+_RULES_MAPPING = """
+modules:
+  policy: drop
+rules:
+  - name: "Cisco generic"
+    match:
+      device_type.manufacturer.slug: "cisco"
+    modules:
+      try: [cisco_generic]
+"""
+
+
+def test_rules_json_returns_snapshot_from_mapping_file(tmp_path, monkeypatch) -> None:
+    mapping = tmp_path / "mapping.yaml"
+    mapping.write_text(_RULES_MAPPING)
+    monkeypatch.setattr(server, "_MAPPING_FILE", str(mapping))
+
+    result = asyncio.run(server.rules(format="json"))
+
+    assert result["rules"][0]["name"] == "Cisco generic"
+    assert result["rules"][0]["match"] == {"device_type.manufacturer.slug": "cisco"}
+
+
+def test_rules_html_renders_a_browsable_page(tmp_path, monkeypatch) -> None:
+    mapping = tmp_path / "mapping.yaml"
+    mapping.write_text(_RULES_MAPPING)
+    monkeypatch.setattr(server, "_MAPPING_FILE", str(mapping))
+
+    response = asyncio.run(server.rules(format="html"))
+
+    assert isinstance(response, server.HTMLResponse)
+    body = response.body.decode()
+    assert "Cisco generic" in body
+    assert "cisco" in body
+
+
+def test_rules_rejects_invalid_format(tmp_path, monkeypatch) -> None:
+    mapping = tmp_path / "mapping.yaml"
+    mapping.write_text(_RULES_MAPPING)
+    monkeypatch.setattr(server, "_MAPPING_FILE", str(mapping))
+
+    with pytest.raises(server.HTTPException) as exc_info:
+        asyncio.run(server.rules(format="xml"))
+    assert exc_info.value.status_code == 400
+
+
+def test_rules_surfaces_missing_mapping_file_as_500(monkeypatch) -> None:
+    monkeypatch.setattr(server, "_MAPPING_FILE", "/nonexistent/mapping.yaml")
+
+    with pytest.raises(server.HTTPException) as exc_info:
+        asyncio.run(server.rules(format="json"))
+    assert exc_info.value.status_code == 500
+
+
+# ── /stats, /health, and the module-mismatch/devices-by-label helpers ──────────
+
+def test_module_mismatch_snapshot_uses_friendly_public_key_names() -> None:
+    with server._module_mismatch_lock:
+        server._module_mismatch["only_in_netbox"] = ["stale_module"]
+        server._module_mismatch["only_in_snmp"]   = ["new_module"]
+    try:
+        snap = server._module_mismatch_snapshot()
+    finally:
+        with server._module_mismatch_lock:
+            server._module_mismatch["only_in_netbox"] = []
+            server._module_mismatch["only_in_snmp"]   = []
+
+    assert snap == {"netbox_only": ["stale_module"], "snmp_exporter_only": ["new_module"]}
+
+
+def test_stats_returns_device_counts_and_module_mismatch() -> None:
+    server.netbox_devices_by_auth.labels(profile="stats_test_profile").set(4)
+    server.netbox_devices_by_module.labels(module="stats_test_module").set(7)
+    with server._module_mismatch_lock:
+        server._module_mismatch["only_in_netbox"] = ["stale_module"]
+        server._module_mismatch["only_in_snmp"]   = ["new_module", "other_module"]
+    try:
+        result = asyncio.run(server.stats())
+    finally:
+        with server._module_mismatch_lock:
+            server._module_mismatch["only_in_netbox"] = []
+            server._module_mismatch["only_in_snmp"]   = []
+
+    assert result["devices_by_auth_profile"]["stats_test_profile"] == 4
+    assert result["devices_by_module"]["stats_test_module"] == 7
+    assert result["module_mismatch"]["netbox_only"] == ["stale_module"]
+    assert result["module_mismatch"]["snmp_exporter_only"] == ["new_module", "other_module"]
+    assert result["module_mismatch"]["netbox_only_count"] == 1
+    assert result["module_mismatch"]["snmp_exporter_only_count"] == 2
+
+
+def test_health_includes_module_mismatch_counts_but_not_full_lists() -> None:
+    with server._module_mismatch_lock:
+        server._module_mismatch["only_in_netbox"] = ["a"]
+        server._module_mismatch["only_in_snmp"]   = ["b", "c"]
+    try:
+        result = asyncio.run(server.health())
+    finally:
+        with server._module_mismatch_lock:
+            server._module_mismatch["only_in_netbox"] = []
+            server._module_mismatch["only_in_snmp"]   = []
+
+    assert result["netbox_only_module_count"] == 1
+    assert result["snmp_exporter_only_module_count"] == 2
+    assert result["status"] == "ok"
+    assert result["version"] == server.__version__
+    assert "netbox_only" not in result  # /health stays a cheap, unauthenticated liveness check
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

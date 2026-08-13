@@ -5,8 +5,11 @@ snmp-modulator server — FastAPI probe trigger + Prometheus metrics.
 Endpoints:
   GET/POST /probe?host=<ip_or_fqdn>          Probe a single device by IP or name
   GET/POST /probe/netbox?<filter_params>     Probe devices matching any NetBox filter
+  GET      /rules                            Loaded mapping.yaml rules/config as JSON
+                                               (add ?format=html for a browsable page)
+  GET      /stats                            Device counts by auth/module + module mismatch, as JSON
   GET      /metrics                          Prometheus metrics
-  GET      /health                           Liveness check
+  GET      /health                           Liveness check (includes module-mismatch counts)
   GET      /docs                             Swagger UI (auto-generated)
 
 /probe/netbox passes query parameters directly to pynetbox's dcim.devices.filter(),
@@ -28,6 +31,7 @@ so any NetBox API filter is valid:
 """
 
 import asyncio
+import html
 import logging
 import os
 import re
@@ -35,7 +39,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
 # When uvicorn runs with multiple workers, each worker has its own in-memory
 # CollectorRegistry, so /metrics scrapes only see whichever worker happens to
@@ -212,6 +216,22 @@ def _metric_samples(name: str) -> dict[tuple, float]:
 
 def _metric_value(name: str) -> float:
     return next(iter(_metric_samples(name).values()), 0.0)
+
+
+def _devices_by_label(metric_name: str, label: str) -> dict:
+    """{label_value: count} for a per-label device-count gauge, e.g.
+    _devices_by_label("modulator_netbox_devices_by_auth", "profile")."""
+    return {dict(k).get(label, "?"): int(v) for k, v in _metric_samples(metric_name).items()}
+
+
+def _module_mismatch_snapshot() -> dict:
+    """{'netbox_only': [...], 'snmp_exporter_only': [...]} — module names known
+    to NetBox's custom-field choices but not snmp-exporter, and vice versa."""
+    with _module_mismatch_lock:
+        return {
+            "netbox_only":        list(_module_mismatch["only_in_netbox"]),
+            "snmp_exporter_only": list(_module_mismatch["only_in_snmp"]),
+        }
 
 
 class _ServerCallbacks(Callbacks):
@@ -600,6 +620,98 @@ async def probe_netbox(
     return {"status": "queued", "filter": filter_params}
 
 
+def _rules_html(snap: dict) -> str:
+    """Render a MappingEngine.snapshot() dict as a dashboard-styled HTML page."""
+    esc = lambda s: html.escape(str(s))  # noqa: E731
+
+    def modules_str(mods: dict) -> str:
+        parts = [
+            f'<span style="color:{color}">{key}</span>: {esc(", ".join(vals))}'
+            for key, color in (("add", "#1D9E75"), ("try", "#9FE1CB"), ("block", "#B8722B"))
+            if (vals := mods.get(key))
+        ]
+        return "<br>".join(parts) or "-"
+
+    def match_str(match: dict) -> str:
+        if not match:
+            return "<i>(always matches)</i>"
+        return "<br>".join(f"<code>{esc(k)}</code> ~ <code>{esc(v)}</code>" for k, v in match.items())
+
+    def handlers_str(h: dict) -> str:
+        parts = [f"{label}: {esc(', '.join(h[key]))}" for key, label in
+                 (("add_tag", "+tag"), ("remove_tag", "-tag"), ("notify", "notify")) if h.get(key)]
+        return "<br>".join(parts) or "-"
+
+    rule_rows = "".join(
+        f"<tr><td>{esc(rule['name'])}</td>"
+        f"<td>{match_str(rule['match'])}</td>"
+        f"<td>{modules_str(rule['modules'])}</td>"
+        f"<td>{esc(rule['auth']) if rule['auth'] else '-'}</td>"
+        f"<td>ok: {handlers_str(rule['on_success'])}<br>fail: {handlers_str(rule['on_fail'])}</td></tr>"
+        for rule in snap["rules"]
+    ) or "<tr><td colspan=5>no rules defined</td></tr>"
+
+    return f"""<!doctype html><html><head><meta charset=utf-8>
+<title>snmp-modulator rules</title>
+<style>{_DASHBOARD_CSS}</style></head><body>
+<h1>snmp-modulator <small style="color:#888;font-size:.5em">v{__version__}</small> — rules</h1>
+<p><a href="/">&larr; dashboard</a> &nbsp; <a href="/rules">raw json</a></p>
+
+<h2>Config</h2>
+<table>
+  <tr><td>module_field / auth_field</td>
+      <td>{esc(snap['module_field'])} / {esc(snap['auth_field'])}</td></tr>
+  <tr><td>interval_field / timeout_field</td>
+      <td>{esc(snap['interval_field'] or '-')} / {esc(snap['timeout_field'] or '-')}</td></tr>
+  <tr><td>touch_field</td><td>{esc(snap['touch_field'] or '-')}</td></tr>
+  <tr><td>default_interval / default_timeout</td>
+      <td>{esc(snap['default_interval'])} / {esc(snap['default_timeout'])}</td></tr>
+  <tr><td>module_policy / auth_policy</td>
+      <td>{esc(snap['module_policy'])} / {esc(snap['auth_policy'])}</td></tr>
+  <tr><td>auth_probe_module</td><td>{esc(snap['auth_probe_module'])}</td></tr>
+</table>
+
+<h2>Defaults</h2>
+<table>
+  <tr><td>modules</td><td>{modules_str(snap['defaults']['modules'])}</td></tr>
+  <tr><td>auth try</td><td>{esc(", ".join(snap['defaults']['auth']['try']) or '-')}</td></tr>
+</table>
+
+<h2>Rules ({len(snap['rules'])})</h2>
+<table>
+  <tr><th>Name</th><th>Match</th><th>Modules</th><th>Auth override</th><th>Handlers</th></tr>
+  {rule_rows}
+</table>
+</body></html>"""
+
+
+@app.get(
+    "/rules",
+    dependencies=[Depends(require_auth)],
+    summary="View the loaded mapping.yaml rules and config",
+)
+async def rules(
+    format: Annotated[str, Query(description="'json' (default) or 'html'")] = "json",
+) -> Any:
+    """
+    Snapshot of the currently loaded mapping file — config, defaults, and every
+    rule (with compiled regexes rendered back to their source pattern strings).
+    Reloaded from disk on every call, so edits to MAPPING_FILE show up without
+    a restart. `format=html` renders it as a browsable page instead of JSON.
+    """
+    if format not in ("json", "html"):
+        raise HTTPException(status_code=400, detail="format must be 'json' or 'html'")
+    try:
+        engine = MappingEngine(_MAPPING_FILE)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"failed to load mapping file {_MAPPING_FILE!r}: {exc}") from exc
+
+    snapshot = engine.snapshot()
+    if format == "html":
+        return HTMLResponse(_rules_html(snapshot))
+    return snapshot
+
+
 @app.get(_METRICS_PATH, include_in_schema=False)
 async def metrics() -> Response:
     if _MULTIPROC_DIR:
@@ -619,17 +731,31 @@ def _start_device_count_refresher() -> None:
     logger.info("NetBox device counts refresher started (interval=%ds)", _NETBOX_REFRESH_INTERVAL)
 
 
+# Shared by index() and /rules?format=html — palette matches banner.svg
+# (teal-green on near-black), kept distinct from bit-discobox's purple/blue theme.
+_DASHBOARD_CSS = """
+  body { font-family: monospace; max-width: 860px; margin: 2em auto; padding: 0 1em;
+          background: #0C0D10; color: #cfe8df; }
+  h1 { color: #5DCAA5; }
+  h2 { color: #9FE1CB; border-bottom: 1px solid #1a1d24; padding-bottom: .3em; }
+  .badge { display:inline-block; padding: .2em .7em; border-radius: 4px; font-weight: bold; color: #fff; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: .4em .8em; border-bottom: 1px solid #1a1d24; vertical-align: top; }
+  th { color: #5DCAA5; }
+  .endpoints td:first-child { color: #5DCAA5; }
+  .endpoints td:nth-child(2) { color: #9FE1CB; }
+  a { color: #5DCAA5; }
+  code { color: #9FE1CB; }
+"""
+
+
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def index() -> str:
     with _in_flight_lock:
         in_flight = sorted(_in_flight)
 
-    by_auth = sorted(
-        (dict(k).get("profile", "?"), int(v)) for k, v in _metric_samples("modulator_netbox_devices_by_auth").items()
-    )
-    by_module = sorted(
-        (dict(k).get("module", "?"), int(v)) for k, v in _metric_samples("modulator_netbox_devices_by_module").items()
-    )
+    by_auth   = sorted(_devices_by_label("modulator_netbox_devices_by_auth", "profile").items())
+    by_module = sorted(_devices_by_label("modulator_netbox_devices_by_module", "module").items())
 
     _no_data = "<tr><td colspan=2>no data yet</td></tr>"
     auth_rows = "".join(f"<tr><td>{p}</td><td>{n}</td></tr>" for p, n in by_auth) or _no_data
@@ -642,36 +768,21 @@ async def index() -> str:
     )
     refresh_str = f"{_NETBOX_REFRESH_INTERVAL}s" if _NETBOX_REFRESH_INTERVAL > 0 else "disabled"
 
-    with _module_mismatch_lock:
-        only_in_netbox = list(_module_mismatch["only_in_netbox"])
-        only_in_snmp   = list(_module_mismatch["only_in_snmp"])
-    if only_in_netbox or only_in_snmp:
+    mismatch = _module_mismatch_snapshot()
+    if mismatch["netbox_only"] or mismatch["snmp_exporter_only"]:
         mismatch_badge = '<span class="badge" style="background:#B8722B">mismatch</span>'
         mismatch_rows = (
-            f"<tr><td>In NetBox, not in snmp-exporter</td><td>{', '.join(only_in_netbox) or '-'}</td></tr>"
-            f"<tr><td>In snmp-exporter, not in NetBox</td><td>{', '.join(only_in_snmp) or '-'}</td></tr>"
+            f"<tr><td>In NetBox, not in snmp-exporter</td><td>{', '.join(mismatch['netbox_only']) or '-'}</td></tr>"
+            f"<tr><td>In snmp-exporter, not in NetBox</td>"
+            f"<td>{', '.join(mismatch['snmp_exporter_only']) or '-'}</td></tr>"
         )
     else:
         mismatch_badge = '<span class="badge" style="background:#1D9E75">in sync</span>'
         mismatch_rows = ""
 
-    # Palette matches banner.svg (teal-green on near-black) — kept distinct from
-    # discobox's purple/blue-on-navy dashboard.
     return f"""<!doctype html><html><head><meta charset=utf-8>
 <title>snmp-modulator</title>
-<style>
-  body {{ font-family: monospace; max-width: 860px; margin: 2em auto; padding: 0 1em;
-          background: #0C0D10; color: #cfe8df; }}
-  h1 {{ color: #5DCAA5; }}
-  h2 {{ color: #9FE1CB; border-bottom: 1px solid #1a1d24; padding-bottom: .3em; }}
-  .badge {{ display:inline-block; padding: .2em .7em; border-radius: 4px; font-weight: bold; color: #fff; }}
-  table {{ border-collapse: collapse; width: 100%; }}
-  th, td {{ text-align: left; padding: .4em .8em; border-bottom: 1px solid #1a1d24; }}
-  th {{ color: #5DCAA5; }}
-  .endpoints td:first-child {{ color: #5DCAA5; }}
-  .endpoints td:nth-child(2) {{ color: #9FE1CB; }}
-  a {{ color: #5DCAA5; }}
-</style></head><body>
+<style>{_DASHBOARD_CSS}</style></head><body>
 <h1>snmp-modulator <small style="color:#888;font-size:.5em">v{__version__}</small></h1>
 <p>Mode: {mode_badge}
 &nbsp; Probes in progress: <b>{int(_metric_value("modulator_probe_in_progress"))}</b>
@@ -686,6 +797,10 @@ async def index() -> str:
   <tr><th>Method</th><th>Path</th><th>Description</th></tr>
   <tr><td>GET/POST</td><td>/probe</td><td>Probe a single device by IP or name</td></tr>
   <tr><td>GET/POST</td><td>/probe/netbox</td><td>Probe devices matching a NetBox filter</td></tr>
+  <tr><td>GET</td><td><a href=/rules>/rules</a></td>
+      <td>Loaded mapping.yaml rules (JSON; add <code>?format=html</code>)</td></tr>
+  <tr><td>GET</td><td><a href=/stats>/stats</a></td>
+      <td>Device counts by auth/module + module mismatch, as JSON</td></tr>
   <tr><td>GET</td><td><a href={_METRICS_PATH}>{_METRICS_PATH}</a></td><td>Prometheus metrics</td></tr>
   <tr><td>GET</td><td><a href=/health>/health</a></td><td>Liveness check</td></tr>
   <tr><td>GET</td><td><a href=/docs>/docs</a></td><td>Swagger UI</td></tr>
@@ -714,13 +829,40 @@ async def index() -> str:
 </body></html>"""
 
 
+@app.get(
+    "/stats",
+    dependencies=[Depends(require_auth)],
+    summary="Device counts by auth profile / module, and NetBox <-> snmp-exporter module mismatch",
+)
+async def stats() -> dict:
+    """
+    JSON view of the numbers shown on the dashboard — the same
+    modulator_netbox_devices_by_{auth,module} gauges and module-mismatch state,
+    refreshed on the same MODULATOR_NETBOX_REFRESH_INTERVAL cycle. Useful for a
+    NetBox plugin panel that wants these without scraping /metrics or the HTML.
+    """
+    mismatch = _module_mismatch_snapshot()
+    return {
+        "devices_by_auth_profile": _devices_by_label("modulator_netbox_devices_by_auth", "profile"),
+        "devices_by_module":       _devices_by_label("modulator_netbox_devices_by_module", "module"),
+        "module_mismatch": {
+            **mismatch,
+            "netbox_only_count":        len(mismatch["netbox_only"]),
+            "snmp_exporter_only_count": len(mismatch["snmp_exporter_only"]),
+        },
+    }
+
+
 @app.get("/health", summary="Liveness check")
 async def health() -> dict:
+    mismatch = _module_mismatch_snapshot()
     return {
         "status": "ok",
         "version": __version__,
         "probe_in_progress": len(_in_flight),
         "in_flight": list(_in_flight),
+        "netbox_only_module_count":        len(mismatch["netbox_only"]),
+        "snmp_exporter_only_module_count": len(mismatch["snmp_exporter_only"]),
     }
 
 

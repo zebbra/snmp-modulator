@@ -6,6 +6,7 @@ Run with `pytest tests/` or directly:
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -257,6 +258,78 @@ def test_evaluate_auth_global_policy_drop_uses_defaults_only(tmp_path) -> None:
     assert fixed is None
     assert candidates == ["public_v2", "private_v2"]  # current value NOT appended (policy=drop)
     assert rule_name is None
+
+
+# ── snapshot(): JSON-serializable view for /rules ───────────────────────────────
+
+MAPPING_SNAPSHOT = """
+touch_field: my_touch_field
+modules:
+  field: snmp_exporter_module
+  policy: try
+  interval_field: snmp_polling_interval
+  default_interval: 5m
+auth:
+  field: snmp_auth_profile
+  policy: try
+defaults:
+  modules:
+    try: [system]
+  auth:
+    try: [public_v2]
+rules:
+  - name: "Cisco generic"
+    match:
+      device_type.manufacturer.slug: "cisco"
+    modules:
+      try: [cisco_generic]
+      block: [if_full]
+    auth:
+      use: legacy_v2
+    on_success:
+      add_tag: [snmp-ready]
+    on_fail:
+      remove_tag: [snmp-ready]
+      notify: [oncall]
+"""
+
+
+def test_snapshot_renders_compiled_regexes_back_to_source_strings(tmp_path) -> None:
+    engine = _engine(tmp_path, MAPPING_SNAPSHOT)
+    snap = engine.snapshot()
+
+    assert snap["rules"][0]["match"] == {"device_type.manufacturer.slug": "cisco"}
+    # every value must be a plain, JSON-serializable type — no compiled re.Pattern objects
+    json.dumps(snap)
+
+
+def test_snapshot_reflects_top_level_config_and_defaults(tmp_path) -> None:
+    engine = _engine(tmp_path, MAPPING_SNAPSHOT)
+    snap = engine.snapshot()
+
+    assert snap["touch_field"] == "my_touch_field"
+    assert snap["module_policy"] == "try"
+    assert snap["auth_policy"] == "try"
+    assert snap["default_interval"] == "5m"
+    assert snap["defaults"]["modules"]["try"] == ["system"]
+    assert snap["defaults"]["auth"]["try"] == ["public_v2"]
+
+
+def test_snapshot_includes_rule_modules_auth_and_handlers(tmp_path) -> None:
+    engine = _engine(tmp_path, MAPPING_SNAPSHOT)
+    rule = engine.snapshot()["rules"][0]
+
+    assert rule["name"] == "Cisco generic"
+    assert rule["modules"] == {"add": [], "try": ["cisco_generic"], "block": ["if_full"]}
+    assert rule["auth"] == {"use": "legacy_v2"}
+    assert rule["on_success"]["add_tag"] == ["snmp-ready"]
+    assert rule["on_fail"]["remove_tag"] == ["snmp-ready"]
+    assert rule["on_fail"]["notify"] == ["oncall"]
+
+
+def test_snapshot_with_no_rules_returns_empty_list(tmp_path) -> None:
+    engine = _engine(tmp_path, "modules:\n  policy: drop\n")
+    assert engine.snapshot()["rules"] == []
 
 
 # ── duration / step helpers ─────────────────────────────────────────────────────
