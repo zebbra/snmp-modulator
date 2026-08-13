@@ -161,6 +161,70 @@ def test_run_probe_releases_semaphore_and_clears_in_flight(monkeypatch) -> None:
     assert "host:10.0.0.1" not in server._in_flight
 
 
+def test_run_probe_forwards_dry_run_override_to_modulator(monkeypatch) -> None:
+    monkeypatch.setattr(
+        server, "_make_clients",
+        lambda: (SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), "drop"),
+    )
+    monkeypatch.setattr(server, "_DRY_RUN", False)
+
+    seen_kwargs = {}
+
+    class FakeModulator:
+        def __init__(self, *a, **kw):
+            seen_kwargs.update(kw)
+
+        def run(self, devices, callbacks=None):
+            return []
+
+    monkeypatch.setattr(server, "Modulator", FakeModulator)
+
+    server._run_probe("host:10.0.0.2", lambda nb: [], dry_run=True)
+    assert seen_kwargs["dry_run"] is True  # overrides server-wide _DRY_RUN=False for this call only
+
+
+def test_run_probe_returns_none_when_no_slot_frees_up_in_time() -> None:
+    assert server._probe_semaphore.acquire(blocking=False)  # occupy the only slot
+    try:
+        server._in_flight.add("host:busy")
+        server.probe_jobs_in_flight.inc()
+        result = server._run_probe("host:busy", lambda nb: ["dev1"], acquire_timeout=0.05)
+    finally:
+        server._probe_semaphore.release()
+
+    assert result is None
+    assert "host:busy" not in server._in_flight  # bookkeeping still cleared on timeout
+
+
+def test_run_probe_swallows_infra_failure_by_default(monkeypatch) -> None:
+    def boom():
+        raise RuntimeError("netbox unreachable")
+
+    monkeypatch.setattr(server, "_make_clients", boom)
+    server._in_flight.add("host:10.0.0.3")
+
+    result = server._run_probe("host:10.0.0.3", lambda nb: ["dev1"])
+
+    assert result == []
+    assert "host:10.0.0.3" not in server._in_flight
+
+
+def test_run_probe_reraises_infra_failure_when_requested(monkeypatch) -> None:
+    def boom():
+        raise RuntimeError("netbox unreachable")
+
+    monkeypatch.setattr(server, "_make_clients", boom)
+    server._in_flight.add("host:10.0.0.4")
+
+    with pytest.raises(RuntimeError, match="netbox unreachable"):
+        server._run_probe("host:10.0.0.4", lambda nb: ["dev1"], reraise=True)
+
+    # semaphore + in-flight bookkeeping still cleaned up despite the raise
+    assert "host:10.0.0.4" not in server._in_flight
+    assert server._probe_semaphore.acquire(blocking=False)
+    server._probe_semaphore.release()
+
+
 # ── _metric_samples / _metric_value ─────────────────────────────────────────────
 
 def test_metric_samples_reads_labeled_gauge_values() -> None:

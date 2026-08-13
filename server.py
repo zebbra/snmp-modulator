@@ -14,14 +14,27 @@ so any NetBox API filter is valid:
   /probe/netbox?role_id=4&last_updated__lt=2025-10-01
   /probe/netbox?site=dc1&tag=snmp-ready
   /probe/netbox?manufacturer=cisco
+
+/probe additionally accepts:
+  wait=true       Block until the probe finishes and return its result as JSON
+                   (default is fire-and-forget: 202 + background job). Not offered
+                   on /probe/netbox — a filter can match many devices, and blocking
+                   an HTTP request on an unbounded multi-device probe risks caller
+                   timeouts and starves the concurrency semaphore for other callers.
+                   If the probe queue is busy, waits up to MODULATOR_WAIT_TIMEOUT
+                   (default 60s) for a free slot, then returns 503 rather than
+                   hanging behind an unrelated bulk probe.
+  dry_run=true|false   Override the server's dry-run mode for this call only.
 """
 
+import asyncio
 import logging
 import os
 import re
 import threading
 import time
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from typing import Annotated, Optional
 
 # When uvicorn runs with multiple workers, each worker has its own in-memory
@@ -51,7 +64,7 @@ if int(os.getenv("MODULATOR_WORKERS", "4")) > 1 and not os.environ.get("PROMETHE
 
 import uvicorn
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     CollectorRegistry,
@@ -62,7 +75,15 @@ from prometheus_client import (
 )
 from prometheus_client.multiprocess import MultiProcessCollector
 
-from modulator import Callbacks, MappingEngine, Modulator, NetboxClient, SnmpExporterClient, compare_module_sets
+from modulator import (
+    Callbacks,
+    MappingEngine,
+    Modulator,
+    NetboxClient,
+    SnmpExporterClient,
+    __version__,
+    compare_module_sets,
+)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -227,6 +248,7 @@ _METRICS_PATH:   str           = os.getenv("MODULATOR_METRICS_PATH", "/metrics")
 _DRY_RUN:       bool = _flag("MODULATOR_DRY_RUN")
 _MAPPING_FILE:  str  = os.getenv("MAPPING_FILE", "mapping.yaml")
 _MAX_CONCURRENT: int           = int(os.getenv("MODULATOR_MAX_CONCURRENT_RUNS", "1"))
+_WAIT_TIMEOUT:  float          = float(os.getenv("MODULATOR_WAIT_TIMEOUT", "60"))
 _DEVICE_PARALLELISM: int       = int(os.getenv("MODULATOR_DEVICE_PARALLELISM", "1"))
 _WORKERS: int                  = int(os.getenv("MODULATOR_WORKERS", "4"))
 _NETBOX_REFRESH_INTERVAL: int = int(os.getenv("MODULATOR_NETBOX_REFRESH_INTERVAL", "3600"))
@@ -263,7 +285,7 @@ async def _lifespan(app: FastAPI):
 app = FastAPI(
     title="snmp-modulator",
     description="Probe NetBox devices against snmp-exporter and update snmp_exporter_module",
-    version="1.0.0",
+    version=__version__,
     lifespan=_lifespan,
 )
 
@@ -395,31 +417,57 @@ def _device_count_loop() -> None:
         time.sleep(_NETBOX_REFRESH_INTERVAL)
 
 
-def _run_probe(job_key: str, devices_fn) -> None:
-    """Execute a probe job in a background thread."""
-    _probe_semaphore.acquire()
-    probe_in_progress.inc()
+def _run_probe(
+    job_key: str,
+    devices_fn,
+    dry_run: Optional[bool] = None,
+    acquire_timeout: Optional[float] = None,
+    reraise: bool = False,
+) -> Optional[list]:
+    """Execute a probe job. Returns list[ModulationResult], or None if no probe
+    slot freed up within acquire_timeout seconds. Background jobs pass
+    acquire_timeout=None and wait indefinitely for their turn; the synchronous
+    wait=true path passes a bound so a busy queue can't hang the HTTP request
+    behind an unrelated bulk probe.
+
+    reraise controls what happens on an infra-level failure (NetBox/snmp-exporter
+    unreachable, etc.): background jobs swallow and log it (False, default);
+    wait=true passes True so the caller gets a real error instead of it being
+    indistinguishable from "no matching device".
+    """
     start = time.time()
+    results: Optional[list] = None
     try:
-        nb, snmp, engine, module_policy = _make_clients()
-        mod = Modulator(
-            nb, snmp, engine,
-            dry_run=_DRY_RUN,
-            module_policy=module_policy,
-            device_parallelism=_DEVICE_PARALLELISM,
-        )
-        devices = devices_fn(nb)
-        mod.run(devices, callbacks=_ServerCallbacks())
-    except Exception as exc:
-        logger.exception("Probe job %r failed: %s", job_key, exc)
+        if not _probe_semaphore.acquire(timeout=acquire_timeout):
+            return None
+        try:
+            probe_in_progress.inc()
+            try:
+                nb, snmp, engine, module_policy = _make_clients()
+                mod = Modulator(
+                    nb, snmp, engine,
+                    dry_run=_DRY_RUN if dry_run is None else dry_run,
+                    module_policy=module_policy,
+                    device_parallelism=_DEVICE_PARALLELISM,
+                )
+                devices = devices_fn(nb)
+                results = mod.run(devices, callbacks=_ServerCallbacks())
+            except Exception as exc:
+                logger.exception("Probe job %r failed: %s", job_key, exc)
+                if reraise:
+                    raise
+                results = []
+            finally:
+                probe_in_progress.dec()
+                probe_duration.observe(time.time() - start)
+        finally:
+            _probe_semaphore.release()
     finally:
-        probe_in_progress.dec()
-        probe_duration.observe(time.time() - start)
-        _probe_semaphore.release()
         with _in_flight_lock:
             _in_flight.discard(job_key)
         probe_jobs_in_flight.dec()
         logger.info("Probe job %r finished in %.1fs", job_key, time.time() - start)
+    return results
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -427,17 +475,25 @@ def _run_probe(job_key: str, devices_fn) -> None:
 @app.api_route(
     "/probe",
     methods=["GET", "POST"],
-    status_code=202,
     dependencies=[Depends(require_auth)],
     summary="Probe a single device by IP or name",
 )
 async def probe_host(
     background_tasks: BackgroundTasks,
     host: Annotated[Optional[str], Query(description="Device IP or name")] = None,
+    wait: Annotated[
+        bool, Query(description="Block until the probe finishes and return its result as JSON")
+    ] = False,
+    dry_run: Annotated[
+        Optional[bool], Query(description="Override the server's dry-run mode for this call only")
+    ] = None,
 ) -> dict:
     """
     Trigger a probe for one device.  `host` can be an IP address or device name.
-    Returns immediately (202); probe runs in the background.
+
+    By default returns immediately (202); probe runs in the background.
+    Pass `wait=true` to block until it finishes and get the result as JSON —
+    e.g. for a NetBox plugin button showing the outcome inline.
     """
     if not host:
         raise HTTPException(status_code=400, detail="host parameter required")
@@ -445,7 +501,12 @@ async def probe_host(
     job_key = f"host:{host}"
     with _in_flight_lock:
         if job_key in _in_flight:
-            return {"status": "skipped", "host": host, "reason": "already in progress"}
+            if wait:
+                raise HTTPException(status_code=409, detail=f"probe for {host!r} already in progress")
+            return JSONResponse(
+                status_code=202,
+                content={"status": "skipped", "host": host, "reason": "already in progress"},
+            )
         _in_flight.add(job_key)
     probe_jobs_in_flight.inc()
 
@@ -456,9 +517,31 @@ async def probe_host(
             return []
         return [device]
 
-    background_tasks.add_task(_run_probe, job_key, fetch)
+    if wait:
+        try:
+            results = await asyncio.to_thread(_run_probe, job_key, fetch, dry_run, _WAIT_TIMEOUT, True)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"probe failed: {exc}") from exc
+        if results is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"probe queue busy — no slot freed up within {_WAIT_TIMEOUT:.0f}s "
+                    f"(MODULATOR_MAX_CONCURRENT_RUNS={_MAX_CONCURRENT}); retry, or drop wait=true"
+                ),
+            )
+        if not results:
+            raise HTTPException(status_code=404, detail=f"host {host!r} not found in NetBox or ineligible")
+        return {
+            "status": "ok",
+            "host": host,
+            "dry_run": _DRY_RUN if dry_run is None else dry_run,
+            "result": asdict(results[0]),
+        }
+
+    background_tasks.add_task(_run_probe, job_key, fetch, dry_run)
     logger.info("Probe queued for host %r", host)
-    return {"status": "queued", "host": host}
+    return JSONResponse(status_code=202, content={"status": "queued", "host": host})
 
 
 @app.api_route(
@@ -589,7 +672,7 @@ async def index() -> str:
   .endpoints td:nth-child(2) {{ color: #9FE1CB; }}
   a {{ color: #5DCAA5; }}
 </style></head><body>
-<h1>snmp-modulator</h1>
+<h1>snmp-modulator <small style="color:#888;font-size:.5em">v{__version__}</small></h1>
 <p>Mode: {mode_badge}
 &nbsp; Probes in progress: <b>{int(_metric_value("modulator_probe_in_progress"))}</b>
 &nbsp; Jobs in flight: <b>{int(_metric_value("modulator_probe_jobs_in_flight"))}</b>
@@ -611,6 +694,7 @@ async def index() -> str:
 <ul>
   <li><code>/probe?host=10.0.0.5</code></li>
   <li><code>/probe?host=switch1.nms.admin.ch</code></li>
+  <li><code>/probe?host=10.0.0.5&amp;wait=true&amp;dry_run=true</code> — blocks and returns the result as JSON</li>
   <li><code>/probe/netbox?role_id=4&amp;last_updated__lt=2025-10-01</code></li>
   <li><code>/probe/netbox?site=dc1&amp;tag=snmp-ready</code></li>
   <li><code>/probe/netbox?manufacturer=cisco</code></li>
@@ -634,6 +718,7 @@ async def index() -> str:
 async def health() -> dict:
     return {
         "status": "ok",
+        "version": __version__,
         "probe_in_progress": len(_in_flight),
         "in_flight": list(_in_flight),
     }
