@@ -56,12 +56,16 @@ probing a canary module and checking `up=1`. Written back to `snmp_auth_profile`
 | `snmp_auth_profile` | text | yes | read + **write** (when auth probing resolves a different profile) |
 | `snmp_polling_interval` | selection | no | read + **write** — Prometheus scrape interval; choice set provides the step ladder |
 | `snmp_polling_timeout` | selection | no | read + **write** — Prometheus scrape timeout; choice set provides the step ladder |
+| `snmp_exporter_module_fast` | multi-select (choice set) | no | read + **write** — fast-profile module list (e.g. `if_traffic`); see [Fast polling profile](#fast-polling-profile) |
+| `snmp_polling_interval_fast` | selection | no | read + **write** — fast-profile scrape interval |
+| `snmp_polling_timeout_fast` | selection | no | read + **write** — fast-profile scrape timeout |
 | `snmp_modulator_last_updated` | date | no | **write** — set to today whenever a device is actually changed; untouched on no-op runs |
 
 The two mandatory fields must exist on all devices the modulator processes. Field names are configurable in `mapping.yaml` (`modules.field`, `auth.field`) and can be overridden per-run via CLI.
 
 Optional fields are only written when enabled in `mapping.yaml`:
 - `snmp_polling_*` — only when `modules.interval_field` / `modules.timeout_field` are set; omit both to measure and log durations without writing
+- `snmp_exporter_module_fast` / `snmp_polling_*_fast` — only when `modules.fast.field` is set; see [Fast polling profile](#fast-polling-profile)
 - `snmp_modulator_last_updated` (or whatever `touch_field` names) — set/omit `touch_field` to enable/disable; must exist as a NetBox custom field on `dcim.device` before enabling
 
 ---
@@ -78,6 +82,14 @@ touch_field: snmp_modulator_last_updated  # date field set on any real change; o
 modules:
   field:  snmp_exporter_module  # NetBox multi-select custom field
   policy: drop                  # use | try | drop
+
+  # Optional fast polling profile — see "Fast polling profile" below.
+  fast:
+    field:            snmp_exporter_module_fast
+    interval_field:   snmp_polling_interval_fast
+    timeout_field:    snmp_polling_timeout_fast
+    default_interval: 1m
+    default_timeout:  20s
 
 auth:
   field:        snmp_auth_profile        # NetBox text custom field
@@ -135,6 +147,13 @@ Each rule has `modules` and `auth`, mirroring the top-level structure:
     block:
       - if_mib           # veto — wins over add/try from any rule
       - _ALL             # nuclear veto — final list is empty regardless of other rules
+    interval: 15m        # floor — recommended normal interval never goes below this
+    timeout:  5m
+    fast:                # opt-in fast profile — see "Fast polling profile" below
+      try:
+        - if_traffic
+      interval: 1m
+      timeout:  20s
   auth:
     try:                 # probe in order; first returning up=1 wins
       - SNMPV3_Foo       # try v3 first, works well when you are in a rolling v2-> v3 migration 
@@ -475,6 +494,63 @@ modules:
 ```
 
 Valid field values: `30s`, `1m`, `90s`, `2m`, `3m`, `4m`, `5m`, `10m`, `15m`.
+
+### Rule-level interval/timeout floors
+
+`modules.interval` / `modules.timeout` on a rule raise the floor the calculated
+recommendation is compared against, on top of `default_interval`/`default_timeout`.
+When multiple matching rules set a floor, the highest wins. Unlike the "only write
+if higher than current" check above, the floor applies to the *recommendation itself* —
+so a rule can force a slow/rarely-changing device to a longer interval even if it
+happens to answer probes quickly (e.g. a remote site over a WAN link where fast
+polling isn't worth the cost regardless of measured latency):
+
+```yaml
+rules:
+  - name: "Remote site (slow WAN link)"
+    match:
+      site.slug: "remote-.*"
+    modules:
+      interval: 15m
+      timeout:  5m
+```
+
+### Fast polling profile
+
+Some modules need tighter polling than the rest of a device's module list — e.g.
+`if_traffic` for bandwidth graphs, while everything else is fine on a relaxed cadence.
+The fast profile is a second, independent module/interval/timeout field set, opt-in
+per rule via `modules.fast.{add,try,block}`:
+
+```yaml
+modules:
+  fast:
+    field:            snmp_exporter_module_fast
+    interval_field:   snmp_polling_interval_fast
+    timeout_field:    snmp_polling_timeout_fast
+    default_interval: 1m
+    default_timeout:  20s
+
+rules:
+  - name: "Remote site (slow WAN link)"
+    match:
+      site.slug: "remote-.*"
+    modules:
+      interval: 15m       # normal-profile floor
+      timeout:  5m
+      fast:
+        try:
+          - if_traffic
+        interval: 1m      # fast-profile floor
+        timeout:  20s
+```
+
+Notes:
+- Omit `modules.fast` entirely at the top level to disable the feature outright — no fast field is ever read or written, regardless of what any rule declares.
+- `add`/`try`/`block` inside `modules.fast` work exactly like the normal profile (unconditional / probe-tested / veto), including `_ALL`. There's no `defaults.modules.fast` — fast polling is opt-in per rule only.
+- A module resolved into the fast profile is **removed from the normal one** — nothing is probed or polled twice under both profiles.
+- `modules.fast.interval` / `modules.fast.timeout` are floors on the fast-profile recommendation, exactly like `modules.interval`/`modules.timeout` are for the normal one.
+- `module_policy` (`use`/`try`/`drop`) applies identically to both profiles' existing module lists.
 
 ---
 

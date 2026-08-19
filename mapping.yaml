@@ -13,6 +13,18 @@ modules:
   default_interval: 3m        # baseline — only write if calculated value is higher
   default_timeout:  2m
 
+  # Fast polling profile — a second module/interval/timeout field set for modules
+  # that need tighter polling than the rest of a device's module list (e.g.
+  # if_traffic). Opt-in per rule via modules.fast.{add,try,block} below; omit
+  # this whole `fast:` block to disable the feature entirely. A module resolved
+  # into the fast profile is removed from the normal one, never both.
+  fast:
+    field:            snmp_exporter_module_fast
+    interval_field:   snmp_polling_interval_fast
+    timeout_field:    snmp_polling_timeout_fast
+    default_interval: 1m
+    default_timeout:  20s
+
 auth:
   field:        snmp_auth_profile
   policy:       use        # use | try | drop — fallback when no rule has auth: section; rule-level auth.try overrides this
@@ -341,6 +353,23 @@ rules:
         - host_ressources
         - if_full_legacy
         - system
+
+  # ── Fast polling profile example ───────────────────────────────────────────
+  # Remote sites on a slow WAN link: keep the normal profile relaxed (floor of
+  # 15m regardless of measured latency — no point polling rarely-changing data
+  # any faster over a slow link) while if_traffic still gets polled every
+  # minute via the fast profile.
+  - name: "Remote site (slow WAN link)"
+    match:
+      site.slug: "remote-.*"
+    modules:
+      interval: 15m
+      timeout:  5m
+      fast:
+        try:
+          - if_traffic
+        interval: 1m
+        timeout:  20s
 
 # ── Last Resorts ─────────────────────────────────────────────────────────────
 

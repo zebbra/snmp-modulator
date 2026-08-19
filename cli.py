@@ -120,6 +120,9 @@ def main(host, netbox_filter, mapping, module_policy, auth_policy, module_field,
         interval_field=engine.interval_field,
         timeout_field=engine.timeout_field,
         touch_field=engine.touch_field,
+        fast_module_field=engine.fast_module_field,
+        fast_interval_field=engine.fast_interval_field,
+        fast_timeout_field=engine.fast_timeout_field,
     )
     verify_tls = os.getenv("SNMP_EXPORTER_TLS_VERIFY", "true").lower() != "false"
     timeout    = int(os.getenv("SNMP_EXPORTER_TIMEOUT", "30"))

@@ -320,7 +320,11 @@ def test_snapshot_includes_rule_modules_auth_and_handlers(tmp_path) -> None:
     rule = engine.snapshot()["rules"][0]
 
     assert rule["name"] == "Cisco generic"
-    assert rule["modules"] == {"add": [], "try": ["cisco_generic"], "block": ["if_full"]}
+    assert rule["modules"] == {
+        "add": [], "try": ["cisco_generic"], "block": ["if_full"],
+        "interval": None, "timeout": None,
+        "fast": {"add": [], "try": [], "block": [], "interval": None, "timeout": None},
+    }
     assert rule["auth"] == {"use": "legacy_v2"}
     assert rule["on_success"]["add_tag"] == ["snmp-ready"]
     assert rule["on_fail"]["remove_tag"] == ["snmp-ready"]
@@ -330,6 +334,109 @@ def test_snapshot_includes_rule_modules_auth_and_handlers(tmp_path) -> None:
 def test_snapshot_with_no_rules_returns_empty_list(tmp_path) -> None:
     engine = _engine(tmp_path, "modules:\n  policy: drop\n")
     assert engine.snapshot()["rules"] == []
+
+
+# ── fast polling profile ─────────────────────────────────────────────────────────
+
+def test_fast_config_defaults_to_unconfigured(tmp_path) -> None:
+    engine = _engine(tmp_path, "modules:\n  policy: drop\n")
+    assert engine.fast_module_field is None
+    assert engine.fast_interval_field is None
+    assert engine.fast_timeout_field is None
+
+
+MAPPING_FAST_CONFIG = """
+modules:
+  policy: drop
+  fast:
+    field:            snmp_exporter_module_fast
+    interval_field:   snmp_polling_interval_fast
+    timeout_field:    snmp_polling_timeout_fast
+    default_interval: 90s
+    default_timeout:  15s
+"""
+
+
+def test_fast_config_reads_field_names_and_defaults(tmp_path) -> None:
+    engine = _engine(tmp_path, MAPPING_FAST_CONFIG)
+    assert engine.fast_module_field == "snmp_exporter_module_fast"
+    assert engine.fast_interval_field == "snmp_polling_interval_fast"
+    assert engine.fast_timeout_field == "snmp_polling_timeout_fast"
+    assert engine.fast_default_interval == 90
+    assert engine.fast_default_timeout == 15
+
+
+def test_evaluate_fast_returns_empty_when_field_not_configured(tmp_path) -> None:
+    # A rule can declare modules.fast.try, but without modules.fast.field at the
+    # top level the whole feature is off — nothing should be resolved into it.
+    engine = _engine(tmp_path, """
+modules:
+  policy: drop
+rules:
+  - name: has-fast-section
+    match: {}
+    modules:
+      fast:
+        try: [if_traffic]
+""")
+    dev = _device()
+    _, _, _, _, matched_rules = engine.evaluate(dev, known_modules=[])
+    unconditional, test_set, block_set = engine.evaluate_fast(dev, matched_rules, known_modules=[])
+    assert (unconditional, test_set, block_set) == (set(), set(), set())
+
+
+def test_evaluate_fast_accumulates_from_matched_rules(tmp_path) -> None:
+    engine = _engine(tmp_path, MAPPING_FAST_CONFIG + """
+rules:
+  - name: fast-rule
+    match:
+      role.slug: "switch"
+    modules:
+      fast:
+        add: [if_traffic_fast_add]
+        try: [if_traffic]
+        block: [if_full]
+""")
+    dev = _device(nb_device=SimpleNamespace(role=SimpleNamespace(slug="switch")))
+    _, _, _, _, matched_rules = engine.evaluate(dev, known_modules=[])
+    unconditional, test_set, block_set = engine.evaluate_fast(dev, matched_rules, known_modules=[])
+    assert unconditional == {"if_traffic_fast_add"}
+    assert test_set == {"if_traffic"}
+    assert block_set == {"if_full"}
+
+
+def test_resolve_polling_floors_takes_max_across_matched_rules_and_default(tmp_path) -> None:
+    engine = _engine(tmp_path, """
+modules:
+  policy: drop
+  default_interval: 3m
+  default_timeout:  2m
+  fast:
+    field: snmp_exporter_module_fast
+rules:
+  - name: remote-a
+    match: {}
+    modules:
+      interval: 10m
+      fast:
+        interval: 1m
+  - name: remote-b
+    match: {}
+    modules:
+      interval: 15m
+      timeout: 5m
+      fast:
+        timeout: 20s
+""")
+    dev = _device()
+    _, _, _, _, matched_rules = engine.evaluate(dev, known_modules=[])
+    interval_floor, timeout_floor, fast_interval_floor, fast_timeout_floor = (
+        engine.resolve_polling_floors(matched_rules)
+    )
+    assert interval_floor == 15 * 60        # higher of the two matched rules
+    assert timeout_floor == 5 * 60          # only remote-b set a normal timeout floor
+    assert fast_interval_floor == 60        # only remote-a set a fast interval floor
+    assert fast_timeout_floor == 20         # only remote-b set a fast timeout floor
 
 
 # ── duration / step helpers ─────────────────────────────────────────────────────

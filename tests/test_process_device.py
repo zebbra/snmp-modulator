@@ -26,6 +26,8 @@ class FakeNetboxClient:
         self.module_updates: list = []
         self.auth_updates: list = []
         self.polling_updates: list = []
+        self.fast_module_updates: list = []
+        self.fast_polling_updates: list = []
 
     def get_polling_step_values(self, field_name):
         return None
@@ -37,11 +39,14 @@ class FakeNetboxClient:
         self.tag_updates.append((device_id, list(add_tags), list(remove_tags)))
 
     def update_snmp_modules(self, device_id, modules, add_tags=(), remove_tags=(),
-                            polling_interval=None, polling_timeout=None):
+                            polling_interval=None, polling_timeout=None,
+                            fast_modules=None, fast_polling_interval=None, fast_polling_timeout=None):
         self.module_updates.append((device_id, list(modules), list(add_tags), list(remove_tags)))
+        self.fast_module_updates.append((device_id, list(fast_modules) if fast_modules is not None else None))
 
-    def update_polling(self, device_id, interval=None, timeout=None):
+    def update_polling(self, device_id, interval=None, timeout=None, fast_interval=None, fast_timeout=None):
         self.polling_updates.append((device_id, interval, timeout))
+        self.fast_polling_updates.append((device_id, fast_interval, fast_timeout))
 
 
 class FakeSnmpExporterClient:
@@ -312,6 +317,174 @@ def test_process_device_survives_stale_unparseable_polling_field(tmp_path) -> No
 
     assert result.error is None
     assert result.changed is True
+
+
+# ── fast polling profile ─────────────────────────────────────────────────────────
+
+MAPPING_FAST = """
+auth:
+  policy: use
+modules:
+  policy: drop
+  fast:
+    field: snmp_exporter_module_fast
+defaults:
+  modules:
+    try: [if_mib]
+rules:
+  - name: fast-rule
+    match: {}
+    modules:
+      fast:
+        try: [if_traffic]
+"""
+
+
+def test_fast_profile_writes_separate_field_and_excludes_from_normal(tmp_path) -> None:
+    engine = _engine(tmp_path, MAPPING_FAST)
+    nb = FakeNetboxClient()
+    snmp = FakeSnmpExporterClient(
+        modules=["if_mib", "if_traffic"],
+        auths=[],
+        probe_results={
+            "if_mib":     ModuleTestResult(module="if_mib", useful=True, metric_count=5, duration_seconds=0.2),
+            "if_traffic": ModuleTestResult(module="if_traffic", useful=True, metric_count=5, duration_seconds=0.1),
+        },
+    )
+    mod = Modulator(nb, snmp, engine, module_policy="drop")
+    dev = _device(snmp_auth_profile="public_v2")
+    result = mod.process_device(dev)
+
+    assert result.final_modules == ["if_mib"]
+    assert result.final_modules_fast == ["if_traffic"]
+    assert result.changed is True
+    assert nb.module_updates == [(1, ["if_mib"], [], [])]
+    assert nb.fast_module_updates == [(1, ["if_traffic"])]
+
+
+def test_fast_profile_wins_when_module_also_in_normal_try(tmp_path) -> None:
+    # A module resolved into the fast profile must never also end up in the
+    # normal one, and must only be probed once even if both a default `try`
+    # and a rule's `fast.try` name it.
+    engine = _engine(tmp_path, """
+auth:
+  policy: use
+modules:
+  policy: drop
+  fast:
+    field: snmp_exporter_module_fast
+defaults:
+  modules:
+    try: [if_mib, if_traffic]
+rules:
+  - name: fast-rule
+    match: {}
+    modules:
+      fast:
+        try: [if_traffic]
+""")
+    nb = FakeNetboxClient()
+    probed: list = []
+
+    class TrackingSnmp(FakeSnmpExporterClient):
+        def probe(self, target, module, auth):
+            probed.append(module)
+            return super().probe(target, module, auth)
+
+    snmp = TrackingSnmp(
+        modules=["if_mib", "if_traffic"],
+        auths=[],
+        probe_results={
+            "if_mib":     ModuleTestResult(module="if_mib", useful=True, metric_count=5, duration_seconds=0.2),
+            "if_traffic": ModuleTestResult(module="if_traffic", useful=True, metric_count=5, duration_seconds=0.1),
+        },
+    )
+    mod = Modulator(nb, snmp, engine, module_policy="drop")
+    dev = _device(snmp_auth_profile="public_v2")
+    result = mod.process_device(dev)
+
+    assert sorted(probed) == ["if_mib", "if_traffic"]   # each probed exactly once
+    assert result.final_modules == ["if_mib"]
+    assert result.final_modules_fast == ["if_traffic"]
+
+
+def test_fast_section_ignored_when_fast_field_not_configured(tmp_path) -> None:
+    # A rule can declare modules.fast.try, but without modules.fast.field at
+    # the top level nothing is written anywhere for it — and it's still probed
+    # since it's in defaults.try, just resolved as a normal module.
+    engine = _engine(tmp_path, """
+auth:
+  policy: use
+modules:
+  policy: drop
+defaults:
+  modules:
+    try: [if_traffic]
+rules:
+  - name: fast-rule
+    match: {}
+    modules:
+      fast:
+        try: [if_traffic]
+""")
+    nb = FakeNetboxClient()
+    snmp = FakeSnmpExporterClient(
+        modules=["if_traffic"],
+        auths=[],
+        probe_results={
+            "if_traffic": ModuleTestResult(module="if_traffic", useful=True, metric_count=5, duration_seconds=0.1),
+        },
+    )
+    mod = Modulator(nb, snmp, engine, module_policy="drop")
+    dev = _device(snmp_auth_profile="public_v2")
+    result = mod.process_device(dev)
+
+    assert result.final_modules == ["if_traffic"]
+    assert result.final_modules_fast == []
+    assert nb.fast_module_updates == [(1, None)]
+
+
+MAPPING_INTERVAL_FLOOR = """
+auth:
+  policy: use
+modules:
+  policy: drop
+  interval_field: snmp_polling_interval
+  timeout_field: snmp_polling_timeout
+  default_interval: 3m
+  default_timeout: 2m
+defaults:
+  modules:
+    try: [if_mib]
+rules:
+  - name: remote-site
+    match: {}
+    modules:
+      interval: 15m
+      timeout: 5m
+"""
+
+
+def test_rule_interval_floor_raises_recommendation_above_measured_duration(tmp_path) -> None:
+    # A quick-responding device matched by a floor rule must still be bumped to
+    # the floor — the floor isn't just "whatever measured duration implies".
+    engine = _engine(tmp_path, MAPPING_INTERVAL_FLOOR)
+    nb = FakeNetboxClient()
+    nb.get_polling_step_values = lambda field_name: [30, 60, 120, 180, 300, 600, 900]
+
+    snmp = FakeSnmpExporterClient(
+        modules=["if_mib"],
+        auths=[],
+        probe_results={
+            "if_mib": ModuleTestResult(module="if_mib", useful=True, metric_count=5, duration_seconds=1.0),
+        },
+    )
+    mod = Modulator(nb, snmp, engine, module_policy="drop")
+    dev = _device(snmp_auth_profile="public_v2")
+    result = mod.process_device(dev)
+
+    assert result.polling_timeout == "5m"
+    assert result.polling_interval == "15m"
     assert result.final_modules == ["if_mib"]
     assert nb.module_updates == [(1, ["if_mib"], [], [])]
 

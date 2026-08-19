@@ -370,6 +370,9 @@ def _make_clients():
         interval_field=engine.interval_field,
         timeout_field=engine.timeout_field,
         touch_field=engine.touch_field,
+        fast_module_field=engine.fast_module_field,
+        fast_interval_field=engine.fast_interval_field,
+        fast_timeout_field=engine.fast_timeout_field,
     )
     verify_tls = os.getenv("SNMP_EXPORTER_TLS_VERIFY", "true").lower() != "false"
     timeout    = int(os.getenv("SNMP_EXPORTER_TIMEOUT", "30"))
@@ -630,6 +633,19 @@ def _rules_html(snap: dict) -> str:
             for key, color in (("add", "#1D9E75"), ("try", "#9FE1CB"), ("block", "#B8722B"))
             if (vals := mods.get(key))
         ]
+        if mods.get("interval") or mods.get("timeout"):
+            interval, timeout = esc(mods.get("interval") or "-"), esc(mods.get("timeout") or "-")
+            parts.append(f"floor: interval={interval} timeout={timeout}")
+        fast = mods.get("fast") or {}
+        fast_parts = [
+            f'<span style="color:{color}">fast.{key}</span>: {esc(", ".join(vals))}'
+            for key, color in (("add", "#1D9E75"), ("try", "#9FE1CB"), ("block", "#B8722B"))
+            if (vals := fast.get(key))
+        ]
+        if fast.get("interval") or fast.get("timeout"):
+            interval, timeout = esc(fast.get("interval") or "-"), esc(fast.get("timeout") or "-")
+            fast_parts.append(f"fast floor: interval={interval} timeout={timeout}")
+        parts.extend(fast_parts)
         return "<br>".join(parts) or "-"
 
     def match_str(match: dict) -> str:
@@ -666,6 +682,11 @@ def _rules_html(snap: dict) -> str:
   <tr><td>touch_field</td><td>{esc(snap['touch_field'] or '-')}</td></tr>
   <tr><td>default_interval / default_timeout</td>
       <td>{esc(snap['default_interval'])} / {esc(snap['default_timeout'])}</td></tr>
+  <tr><td>fast_module_field</td><td>{esc(snap['fast_module_field'] or '-')}</td></tr>
+  <tr><td>fast_interval_field / fast_timeout_field</td>
+      <td>{esc(snap['fast_interval_field'] or '-')} / {esc(snap['fast_timeout_field'] or '-')}</td></tr>
+  <tr><td>fast_default_interval / fast_default_timeout</td>
+      <td>{esc(snap['fast_default_interval'])} / {esc(snap['fast_default_timeout'])}</td></tr>
   <tr><td>module_policy / auth_policy</td>
       <td>{esc(snap['module_policy'])} / {esc(snap['auth_policy'])}</td></tr>
   <tr><td>auth_probe_module</td><td>{esc(snap['auth_probe_module'])}</td></tr>

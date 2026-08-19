@@ -12,7 +12,7 @@ __version__ = "1.1.0"
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Optional
 
@@ -74,6 +74,39 @@ def _round_up_to_step(seconds: float, steps: list) -> int:
     return steps[-1]
 
 
+def _recommend_polling(probed_durations: list, interval_steps: list, timeout_steps: list,
+                        interval_floor_s: int, timeout_floor_s: int,
+                        current_interval: Optional[str], current_timeout: Optional[str],
+                        default_interval: int, default_timeout: int,
+                        label: str, log) -> tuple:
+    """Shared normal/fast polling recommendation.
+
+    Total probe duration is rounded up to the nearest NetBox choice-set step,
+    then raised to at least the resolved floor (global default or a rule's
+    interval/timeout override, whichever is higher). The recommendation is
+    only returned (non-None) when it exceeds the device's current value, so
+    an existing setting never regresses.
+    """
+    total_s = sum(probed_durations)
+    rec_timeout_s  = max(_round_up_to_step(total_s * 1.5, timeout_steps),
+                         _round_up_to_step(timeout_floor_s, timeout_steps))
+    rec_interval_s = max(_round_up_to_step(rec_timeout_s * 2, interval_steps),
+                         _round_up_to_step(interval_floor_s, interval_steps))
+
+    cur_timeout_s  = _current_duration_or_default(current_timeout, default_timeout, f"{label} timeout", log)
+    cur_interval_s = _current_duration_or_default(current_interval, default_interval, f"{label} interval", log)
+
+    new_timeout  = _format_duration(rec_timeout_s)  if rec_timeout_s  > cur_timeout_s  else None
+    new_interval = _format_duration(rec_interval_s) if rec_interval_s > cur_interval_s else None
+
+    log.info(
+        "Polling(%s): total_probe=%.1fs  rec_timeout=%s  rec_interval=%s%s",
+        label, total_s, _format_duration(rec_timeout_s), _format_duration(rec_interval_s),
+        f"  timeout→{new_timeout}  interval→{new_interval}" if (new_timeout or new_interval) else "  ok",
+    )
+    return new_interval, new_timeout
+
+
 def compare_module_sets(nb_valid_modules: Optional[frozenset], snmp_modules: set) -> tuple:
     """Diff NetBox's module choice set against snmp-exporter's known modules.
 
@@ -96,6 +129,9 @@ class DeviceInfo:
     current_modules: list       # from custom_fields.snmp_exporter_module
     polling_interval: Optional[str] = None   # e.g. "3m" — None means use default
     polling_timeout:  Optional[str] = None   # e.g. "2m" — None means use default
+    current_modules_fast: list = field(default_factory=list)   # fast-profile counterpart; empty when unconfigured
+    polling_interval_fast: Optional[str] = None
+    polling_timeout_fast:  Optional[str] = None
     nb_device: Any = None       # raw pynetbox Record for flexible match key traversal
 
 
@@ -120,6 +156,10 @@ class ModulationResult:
     auth_changed: bool = False           # True if auth profile was written back to NetBox
     polling_interval: Optional[str] = None   # new interval written to NetBox (None = unchanged)
     polling_timeout:  Optional[str] = None   # new timeout written to NetBox (None = unchanged)
+    previous_modules_fast: list = field(default_factory=list)
+    final_modules_fast:    list = field(default_factory=list)
+    polling_interval_fast: Optional[str] = None
+    polling_timeout_fast:  Optional[str] = None
     unreachable: bool = False                # all probes returned useless; existing module list preserved
     error: Optional[str] = None
 
@@ -153,6 +193,9 @@ class NetboxClient:
         interval_field: str = "snmp_polling_interval",
         timeout_field: str = "snmp_polling_timeout",
         touch_field: Optional[str] = None,
+        fast_module_field: Optional[str] = None,
+        fast_interval_field: Optional[str] = None,
+        fast_timeout_field: Optional[str] = None,
     ):
         session = _ChangelogSession(APP_NAME)
         if not verify_tls:
@@ -160,21 +203,27 @@ class NetboxClient:
             session.verify = False
         self.nb = pynetbox.api(url, token=token)
         self.nb.http_session = session
-        self._module_field      = module_field
-        self._auth_field        = auth_field
-        self._interval_field    = interval_field
-        self._timeout_field     = timeout_field
-        self._touch_field       = touch_field
-        self._valid_modules: Optional[frozenset] = self._fetch_module_choices()
+        self._module_field       = module_field
+        self._auth_field         = auth_field
+        self._interval_field     = interval_field
+        self._timeout_field      = timeout_field
+        self._touch_field        = touch_field
+        self._fast_module_field   = fast_module_field
+        self._fast_interval_field = fast_interval_field
+        self._fast_timeout_field  = fast_timeout_field
+        self._valid_modules: Optional[frozenset] = self._fetch_module_choices(self._module_field)
+        self._valid_modules_fast: Optional[frozenset] = (
+            self._fetch_module_choices(self._fast_module_field) if self._fast_module_field else None
+        )
 
-    def _fetch_module_choices(self) -> Optional[frozenset]:
-        """Fetch valid choices for the module multi-select field from NetBox.
+    def _fetch_module_choices(self, field_name: str) -> Optional[frozenset]:
+        """Fetch valid choices for a module multi-select field from NetBox.
 
         NetBox 3.3+ stores choices on a linked CustomFieldChoiceSet; older
         versions exposed them directly on the custom field.
         """
         try:
-            cf = self.nb.extras.custom_fields.get(name=self._module_field)
+            cf = self.nb.extras.custom_fields.get(name=field_name)
             if not cf:
                 return None
 
@@ -187,20 +236,20 @@ class NetboxClient:
                     raw = getattr(cs, "extra_choices", None) or getattr(cs, "choices", None)
                     if raw:
                         choices = frozenset(c[0] for c in raw)
-                        logger.info("NetBox module field %r: %d valid choice(s)", self._module_field, len(choices))
+                        logger.info("NetBox module field %r: %d valid choice(s)", field_name, len(choices))
                         return choices
 
             # Older NetBox: choices directly on the custom field
             direct = getattr(cf, "choices", None)
             if direct:
                 choices = frozenset(c.value for c in direct)
-                logger.info("NetBox module field %r: %d valid choice(s)", self._module_field, len(choices))
+                logger.info("NetBox module field %r: %d valid choice(s)", field_name, len(choices))
                 return choices
 
         except Exception as exc:
             logger.warning(
                 "Could not fetch NetBox choices for %r: %s — unknown modules will not be filtered",
-                self._module_field, exc,
+                field_name, exc,
             )
         return None
 
@@ -278,14 +327,11 @@ class NetboxClient:
             cf = dev.custom_fields or {}
             snmp_auth_profile = cf.get(self._auth_field) or ""
 
-            cf_modules = cf.get(self._module_field) or []
-            if isinstance(cf_modules, list):
-                current_modules = [
-                    item["value"] if isinstance(item, dict) else str(item)
-                    for item in cf_modules
-                ]
-            else:
-                current_modules = []
+            current_modules = self._flatten_multiselect(cf.get(self._module_field))
+            current_modules_fast = (
+                self._flatten_multiselect(cf.get(self._fast_module_field))
+                if self._fast_module_field else []
+            )
 
             devices.append(DeviceInfo(
                 id=dev.id,
@@ -295,11 +341,25 @@ class NetboxClient:
                 current_modules=current_modules,
                 polling_interval=cf.get(self._interval_field) or None,
                 polling_timeout=cf.get(self._timeout_field)   or None,
+                current_modules_fast=current_modules_fast,
+                polling_interval_fast=(
+                    (cf.get(self._fast_interval_field) or None) if self._fast_interval_field else None
+                ),
+                polling_timeout_fast=(
+                    (cf.get(self._fast_timeout_field) or None) if self._fast_timeout_field else None
+                ),
                 nb_device=dev,
             ))
 
         logger.info("Fetched %d eligible device(s) from NetBox", len(devices))
         return devices
+
+    @staticmethod
+    def _flatten_multiselect(raw: Any) -> list:
+        """Normalize a NetBox multi-select custom field value to a list of strings."""
+        if not isinstance(raw, list):
+            return []
+        return [item["value"] if isinstance(item, dict) else str(item) for item in raw]
 
     def get_device_by_host(self, host: str) -> Optional[DeviceInfo]:
         """
@@ -337,8 +397,12 @@ class NetboxClient:
     def update_snmp_modules(self, device_id: int, modules: list,
                             add_tags: list = (), remove_tags: list = (),
                             polling_interval: Optional[str] = None,
-                            polling_timeout: Optional[str] = None) -> None:
-        """Update the module multi-select custom field, optionally batching tag/polling changes."""
+                            polling_timeout: Optional[str] = None,
+                            fast_modules: Optional[list] = None,
+                            fast_polling_interval: Optional[str] = None,
+                            fast_polling_timeout: Optional[str] = None) -> None:
+        """Update the module multi-select custom field, optionally batching tag/polling
+        changes and the fast-profile module field/interval/timeout (when configured)."""
         if self._valid_modules is not None:
             unknown = [m for m in modules if m not in self._valid_modules]
             if unknown:
@@ -350,6 +414,17 @@ class NetboxClient:
             cf[self._interval_field] = polling_interval
         if polling_timeout is not None:
             cf[self._timeout_field] = polling_timeout
+        if fast_modules is not None and self._fast_module_field:
+            if self._valid_modules_fast is not None:
+                unknown = [m for m in fast_modules if m not in self._valid_modules_fast]
+                if unknown:
+                    logger.warning("Dropping fast module(s) not in NetBox choices: %s", unknown)
+                    fast_modules = [m for m in fast_modules if m in self._valid_modules_fast]
+            cf[self._fast_module_field] = fast_modules
+            if fast_polling_interval is not None and self._fast_interval_field:
+                cf[self._fast_interval_field] = fast_polling_interval
+            if fast_polling_timeout is not None and self._fast_timeout_field:
+                cf[self._fast_timeout_field] = fast_polling_timeout
         if self._touch_field:
             cf[self._touch_field] = date.today().isoformat()
         payload = {"custom_fields": cf}
@@ -359,13 +434,19 @@ class NetboxClient:
 
     def update_polling(self, device_id: int,
                        interval: Optional[str] = None,
-                       timeout: Optional[str] = None) -> None:
+                       timeout: Optional[str] = None,
+                       fast_interval: Optional[str] = None,
+                       fast_timeout: Optional[str] = None) -> None:
         """Update polling interval/timeout fields standalone (when modules unchanged)."""
         cf = {}
         if interval is not None:
             cf[self._interval_field] = interval
         if timeout is not None:
             cf[self._timeout_field] = timeout
+        if fast_interval is not None and self._fast_interval_field:
+            cf[self._fast_interval_field] = fast_interval
+        if fast_timeout is not None and self._fast_timeout_field:
+            cf[self._fast_timeout_field] = fast_timeout
         if cf:
             if self._touch_field:
                 cf[self._touch_field] = date.today().isoformat()
@@ -610,6 +691,17 @@ class MappingEngine:
         self.default_interval: int = _parse_duration(modules_cfg.get("default_interval", "3m"))
         self.default_timeout:  int = _parse_duration(modules_cfg.get("default_timeout",  "2m"))
 
+        # ── Fast polling profile (optional second module/interval/timeout field
+        # set) — e.g. if_traffic polled every minute while everything else stays
+        # on the normal cadence. Opt-in per rule via modules.fast.{add,try,block};
+        # omitting the whole `fast:` block here disables the feature entirely.
+        fast_cfg = modules_cfg.get("fast") or {}
+        self.fast_module_field:    Optional[str] = fast_cfg.get("field")          or None
+        self.fast_interval_field:  Optional[str] = fast_cfg.get("interval_field") or None
+        self.fast_timeout_field:   Optional[str] = fast_cfg.get("timeout_field")  or None
+        self.fast_default_interval: int = _parse_duration(fast_cfg.get("default_interval", "1m"))
+        self.fast_default_timeout:  int = _parse_duration(fast_cfg.get("default_timeout",  "20s"))
+
         self.module_policy:  str = modules_cfg.get("policy", "drop")
         if self.module_policy not in MODULE_POLICIES:
             raise ValueError(
@@ -635,13 +727,28 @@ class MappingEngine:
         # ── Rules ─────────────────────────────────────────────────────────────
         self._rules = []
         for r in raw.get("rules", []):
-            mod = r.get("modules", {})
+            mod      = r.get("modules", {})
+            fast_mod = mod.get("fast") or {}
             self._rules.append({
                 "name":           r.get("name", "(unnamed)"),
                 "compiled_match": self._compile_match(r.get("match", {})),
                 "add":            list(mod.get("add",   [])),
                 "try":            list(mod.get("try",   [])),
                 "block":          list(mod.get("block", [])),
+                # Floor overrides — raise the normal-profile interval/timeout
+                # recommendation for devices this rule matches (e.g. remote sites).
+                # None means "no floor beyond the global default".
+                "interval":       _parse_duration(str(mod["interval"])) if mod.get("interval") is not None else None,
+                "timeout":        _parse_duration(str(mod["timeout"]))  if mod.get("timeout")  is not None else None,
+                "fast_add":       list(fast_mod.get("add",   [])),
+                "fast_try":       list(fast_mod.get("try",   [])),
+                "fast_block":     list(fast_mod.get("block", [])),
+                "fast_interval":  (
+                    _parse_duration(str(fast_mod["interval"])) if fast_mod.get("interval") is not None else None
+                ),
+                "fast_timeout":   (
+                    _parse_duration(str(fast_mod["timeout"])) if fast_mod.get("timeout") is not None else None
+                ),
                 "auth":           r.get("auth"),
                 "on_success":     self._parse_handlers(r.get("on_success") or {}),
                 "on_fail":        self._parse_handlers(r.get("on_fail")    or {}),
@@ -649,7 +756,7 @@ class MappingEngine:
 
         logger.info(
             "Mapping loaded: %d rule(s)  defaults: add=%d try=%d block=%d  "
-            "module_policy=%s  auth_policy=%s  module_field=%r  auth_field=%r  touch_field=%r",
+            "module_policy=%s  auth_policy=%s  module_field=%r  auth_field=%r  touch_field=%r  fast_module_field=%r",
             len(self._rules),
             len(self._default_add),
             len(self._default_try),
@@ -659,6 +766,7 @@ class MappingEngine:
             self.module_field,
             self.auth_field,
             self.touch_field,
+            self.fast_module_field,
         )
 
     @staticmethod
@@ -680,6 +788,11 @@ class MappingEngine:
             "touch_field":     self.touch_field,
             "default_interval": _format_duration(self.default_interval),
             "default_timeout":  _format_duration(self.default_timeout),
+            "fast_module_field":     self.fast_module_field,
+            "fast_interval_field":   self.fast_interval_field,
+            "fast_timeout_field":    self.fast_timeout_field,
+            "fast_default_interval": _format_duration(self.fast_default_interval),
+            "fast_default_timeout":  _format_duration(self.fast_default_timeout),
             "module_policy":    self.module_policy,
             "auth_policy":      self.auth_policy,
             "auth_probe_module": self.auth_probe_module,
@@ -695,7 +808,20 @@ class MappingEngine:
                 {
                     "name":  rule["name"],
                     "match": {field: pattern.pattern for field, pattern in rule["compiled_match"].items()},
-                    "modules": {"add": rule["add"], "try": rule["try"], "block": rule["block"]},
+                    "modules": {
+                        "add": rule["add"], "try": rule["try"], "block": rule["block"],
+                        "interval": _format_duration(rule["interval"]) if rule["interval"] is not None else None,
+                        "timeout":  _format_duration(rule["timeout"])  if rule["timeout"]  is not None else None,
+                        "fast": {
+                            "add": rule["fast_add"], "try": rule["fast_try"], "block": rule["fast_block"],
+                            "interval": (
+                                _format_duration(rule["fast_interval"]) if rule["fast_interval"] is not None else None
+                            ),
+                            "timeout": (
+                                _format_duration(rule["fast_timeout"]) if rule["fast_timeout"] is not None else None
+                            ),
+                        },
+                    },
                     "auth":       rule["auth"],
                     "on_success": rule["on_success"],
                     "on_fail":    rule["on_fail"],
@@ -752,6 +878,65 @@ class MappingEngine:
         test -= unconditional  # already added unconditionally — no need to probe
 
         return unconditional, test, block, matched_names, matched_rules
+
+    def evaluate_fast(self, device: DeviceInfo, matched_rules: list, known_modules: list = ()) -> tuple:
+        """
+        Fast-profile counterpart to evaluate() — accumulates modules.fast.{add,try,block}
+        from rules already matched by evaluate() (no second rule walk needed).
+
+        Returns (unconditional_set, test_set, block_set) — empty sets when the fast
+        profile isn't configured (modules.fast.field unset) or no matched rule
+        declares a fast section. Unlike the normal profile, fast has no defaults
+        section — it's opt-in per rule only.
+        """
+        if not self.fast_module_field:
+            return set(), set(), set()
+
+        unconditional: set = set()
+        test: set          = set()
+        block: set         = set()
+        for rule in matched_rules:
+            unconditional.update(rule["fast_add"])
+            test.update(rule["fast_try"])
+            block.update(rule["fast_block"])
+
+        if "_ALL" in block:
+            full_block = (block - {"_ALL"}) | set(known_modules) | set(device.current_modules_fast)
+            return set(), set(), full_block
+
+        if "_ALL" in test:
+            if not known_modules:
+                logger.warning("_ALL in fast try but no module list available (snmp-exporter /config not loaded)")
+            test = (test - {"_ALL"}) | set(known_modules)
+
+        unconditional -= block
+        test -= block
+        test -= unconditional
+        return unconditional, test, block
+
+    def resolve_polling_floors(self, matched_rules: list) -> tuple:
+        """
+        Returns (interval_floor_s, timeout_floor_s, fast_interval_floor_s, fast_timeout_floor_s)
+        in seconds — the highest value across the global default and every matched
+        rule's modules.interval/timeout (and modules.fast.interval/timeout) override.
+        Used as a floor on top of the measured-duration recommendation, so e.g. a
+        remote-site rule can guarantee at least a 15m normal interval regardless of
+        how fast that device actually responds.
+        """
+        interval_floor      = self.default_interval
+        timeout_floor       = self.default_timeout
+        fast_interval_floor = self.fast_default_interval
+        fast_timeout_floor  = self.fast_default_timeout
+        for rule in matched_rules:
+            if rule["interval"] is not None:
+                interval_floor = max(interval_floor, rule["interval"])
+            if rule["timeout"] is not None:
+                timeout_floor = max(timeout_floor, rule["timeout"])
+            if rule["fast_interval"] is not None:
+                fast_interval_floor = max(fast_interval_floor, rule["fast_interval"])
+            if rule["fast_timeout"] is not None:
+                fast_timeout_floor = max(fast_timeout_floor, rule["fast_timeout"])
+        return interval_floor, timeout_floor, fast_interval_floor, fast_timeout_floor
 
     def _match_rule(self, rule: dict, device: DeviceInfo) -> bool:
         """All patterns in compiled_match must match. Absent key = wildcard."""
@@ -965,6 +1150,31 @@ class Modulator:
             else:
                 logger.warning("Timeout steps unavailable for %r — polling calculation disabled", engine.timeout_field)
 
+        self._fast_interval_steps: Optional[list] = None
+        self._fast_timeout_steps:  Optional[list] = None
+        if engine.fast_interval_field:
+            self._fast_interval_steps = nb.get_polling_step_values(engine.fast_interval_field)
+            if self._fast_interval_steps:
+                logger.info(
+                    "Fast interval steps from NetBox %r: %s", engine.fast_interval_field, self._fast_interval_steps
+                )
+            else:
+                logger.warning(
+                    "Fast interval steps unavailable for %r — fast polling calculation disabled",
+                    engine.fast_interval_field,
+                )
+        if engine.fast_timeout_field:
+            self._fast_timeout_steps = nb.get_polling_step_values(engine.fast_timeout_field)
+            if self._fast_timeout_steps:
+                logger.info(
+                    "Fast timeout steps from NetBox %r: %s", engine.fast_timeout_field, self._fast_timeout_steps
+                )
+            else:
+                logger.warning(
+                    "Fast timeout steps unavailable for %r — fast polling calculation disabled",
+                    engine.fast_timeout_field,
+                )
+
         self._compare_module_sets()
 
     def _apply_handlers(self, device: DeviceInfo, matched_rules: list, success: bool, log) -> None:
@@ -1155,26 +1365,40 @@ class Modulator:
             # ── Module evaluation ─────────────────────────────────────────────
             log.info("Module rules matched: %s", matched_names if matched_names else "(none)")
 
-            # Apply existing-module policy
+            fast_unconditional, fast_test_set, fast_block_set = self.engine.evaluate_fast(
+                device, matched_rules, known_modules=active_snmp.modules
+            )
+
+            # Apply existing-module policy — same policy governs both profiles.
             existing = set(device.current_modules) - block_set
             if self.module_policy == "use":
                 unconditional |= existing
             elif self.module_policy == "try":
                 test_set |= existing - unconditional
 
+            existing_fast = set(device.current_modules_fast) - fast_block_set
+            if self.module_policy == "use":
+                fast_unconditional |= existing_fast
+            elif self.module_policy == "try":
+                fast_test_set |= existing_fast - fast_unconditional
+
             log.debug(
-                "Modules — add=%s try=%s block=%s",
+                "Modules — add=%s try=%s block=%s  fast: add=%s try=%s block=%s",
                 sorted(unconditional), sorted(test_set), sorted(block_set),
+                sorted(fast_unconditional), sorted(fast_test_set), sorted(fast_block_set),
             )
 
-            # Probe each try-module using the resolved auth profile. Test the canary
-            # module first when it's in the set — the auth_candidates path already
-            # confirms reachability via probe_auth before we get here, but fixed_auth
-            # skips that, so without this a fully offline device would otherwise burn
-            # the full per-module timeout on every module before anything gives up.
+            # Probe each try-module (normal + fast, one pass — a module can only be
+            # probed once regardless of which profile it ends up written to) using
+            # the resolved auth profile. Test the canary module first when it's in
+            # the set — the auth_candidates path already confirms reachability via
+            # probe_auth before we get here, but fixed_auth skips that, so without
+            # this a fully offline device would otherwise burn the full per-module
+            # timeout on every module before anything gives up.
+            combined_test = test_set | fast_test_set
             test_results: list = []
-            probe_order = sorted(test_set)
-            if canary_module in test_set:
+            probe_order = sorted(combined_test)
+            if canary_module in combined_test:
                 probe_order.remove(canary_module)
                 probe_order.insert(0, canary_module)
 
@@ -1199,24 +1423,33 @@ class Modulator:
                     )
                     break
 
-            # Build final module set
+            # Build final module sets. Fast wins on overlap — anything resolved into
+            # the fast profile is removed from the normal one so nothing is polled
+            # (or written) under both profiles at once.
             useful_modules = {r.module for r in test_results if r.useful}
-            final_modules  = sorted(unconditional | useful_modules)
-            previous_modules = sorted(device.current_modules)
+            final_modules_fast = sorted(fast_unconditional | (useful_modules & fast_test_set))
+            final_modules = sorted(
+                (unconditional | (useful_modules & test_set)) - set(final_modules_fast)
+            )
+            previous_modules      = sorted(device.current_modules)
+            previous_modules_fast = sorted(device.current_modules_fast)
 
             # Unreachable guard: if every probe ran but none returned useful data
-            # AND the device had a populated module list, treat as unreachable and
-            # preserve the existing list rather than wiping it.
+            # AND the device had a populated module list (either profile), treat as
+            # unreachable and preserve the existing lists rather than wiping them.
             all_probes_failed = bool(test_results) and not any(r.useful for r in test_results)
-            unreachable       = all_probes_failed and bool(previous_modules)
+            unreachable       = all_probes_failed and bool(previous_modules or previous_modules_fast)
             if unreachable:
                 log.warning(
                     "All %d module probes returned no useful data — device may be unreachable; "
-                    "preserving existing module list", len(test_results),
+                    "preserving existing module list(s)", len(test_results),
                 )
-                final_modules = previous_modules
+                final_modules      = previous_modules
+                final_modules_fast = previous_modules_fast
 
-            changed = final_modules != previous_modules
+            changed      = final_modules != previous_modules
+            changed_fast = final_modules_fast != previous_modules_fast
+            modules_changed = changed or changed_fast
 
             if changed:
                 added   = sorted(set(final_modules) - set(previous_modules))
@@ -1226,50 +1459,69 @@ class Modulator:
                     callbacks.module_changed(module=m, action="added")
                 for m in removed:
                     callbacks.module_changed(module=m, action="removed")
+            if changed_fast:
+                added_fast   = sorted(set(final_modules_fast) - set(previous_modules_fast))
+                removed_fast = sorted(set(previous_modules_fast) - set(final_modules_fast))
+                log.info("Modules changed (fast) — added=%s removed=%s", added_fast, removed_fast)
+                for m in added_fast:
+                    callbacks.module_changed(module=m, action="added")
+                for m in removed_fast:
+                    callbacks.module_changed(module=m, action="removed")
 
             # ── Polling calculation ───────────────────────────────────────────
             # Requires both NetBox choice sets to be available; otherwise skipped.
-            final_set = set(final_modules)
-            probed_durations = [r.duration_seconds for r in test_results if r.module in final_set]
-            new_interval = new_timeout = None
+            # Floors come from the global default and any matched rule's
+            # modules.interval/timeout (or modules.fast.interval/timeout) override.
+            interval_floor_s, timeout_floor_s, fast_interval_floor_s, fast_timeout_floor_s = (
+                self.engine.resolve_polling_floors(matched_rules)
+            )
+            final_set      = set(final_modules)
+            final_set_fast = set(final_modules_fast)
+            probed_durations      = [r.duration_seconds for r in test_results if r.module in final_set]
+            probed_durations_fast = [r.duration_seconds for r in test_results if r.module in final_set_fast]
+
+            new_interval = new_timeout = new_interval_fast = new_timeout_fast = None
             if unreachable:
                 pass  # don't trust durations from a likely-unreachable device
-            elif probed_durations and self._timeout_steps and self._interval_steps:
-                total_s = sum(probed_durations)
-                rec_timeout_s  = _round_up_to_step(total_s * 1.5, self._timeout_steps)
-                rec_interval_s = _round_up_to_step(rec_timeout_s * 2, self._interval_steps)
+            else:
+                if self._interval_steps and self._timeout_steps:
+                    new_interval, new_timeout = _recommend_polling(
+                        probed_durations, self._interval_steps, self._timeout_steps,
+                        interval_floor_s, timeout_floor_s,
+                        device.polling_interval, device.polling_timeout,
+                        self.engine.default_interval, self.engine.default_timeout,
+                        "normal", log,
+                    )
+                elif probed_durations:
+                    log.info(
+                        "Polling: total_probe=%.1fs  (calculation skipped — choice set unavailable)",
+                        sum(probed_durations),
+                    )
 
-                cur_timeout_s = _current_duration_or_default(
-                    device.polling_timeout, self.engine.default_timeout, "polling timeout", log
-                )
-                cur_interval_s = _current_duration_or_default(
-                    device.polling_interval, self.engine.default_interval, "polling interval", log
-                )
-                if rec_timeout_s  > cur_timeout_s:
-                    new_timeout  = _format_duration(rec_timeout_s)
-                if rec_interval_s > cur_interval_s:
-                    new_interval = _format_duration(rec_interval_s)
-
-                log.info(
-                    "Polling: total_probe=%.1fs  rec_timeout=%s  rec_interval=%s%s",
-                    total_s,
-                    _format_duration(rec_timeout_s),
-                    _format_duration(rec_interval_s),
-                    f"  timeout→{new_timeout}  interval→{new_interval}"
-                    if (new_timeout or new_interval) else "  ok",
-                )
-            elif probed_durations:
-                log.info(
-                    "Polling: total_probe=%.1fs  (calculation skipped — choice set unavailable)",
-                    sum(probed_durations),
-                )
+                if self.engine.fast_module_field and self._fast_interval_steps and self._fast_timeout_steps:
+                    new_interval_fast, new_timeout_fast = _recommend_polling(
+                        probed_durations_fast, self._fast_interval_steps, self._fast_timeout_steps,
+                        fast_interval_floor_s, fast_timeout_floor_s,
+                        device.polling_interval_fast, device.polling_timeout_fast,
+                        self.engine.fast_default_interval, self.engine.fast_default_timeout,
+                        "fast", log,
+                    )
+                elif probed_durations_fast and self.engine.fast_module_field:
+                    log.info(
+                        "Polling(fast): total_probe=%.1fs  (calculation skipped — choice set unavailable)",
+                        sum(probed_durations_fast),
+                    )
 
             # ── Handlers + NetBox write ───────────────────────────────────────
-            # success requires a non-empty final module set AND no probe errors.
-            # Vacuously-true (no probing at all, e.g. nuclear veto) is treated as
-            # failure so on_fail handlers fire (e.g. "Last-resort discovery" adds
-            # fixme/snmp when the device has no auth and nothing could be probed).
-            success  = bool(final_modules) and not any(r.error for r in test_results) and not unreachable
+            # success requires a non-empty final module set (either profile) AND no
+            # probe errors. Vacuously-true (no probing at all, e.g. nuclear veto) is
+            # treated as failure so on_fail handlers fire (e.g. "Last-resort discovery"
+            # adds fixme/snmp when the device has no auth and nothing could be probed).
+            success  = (
+                bool(final_modules or final_modules_fast)
+                and not any(r.error for r in test_results)
+                and not unreachable
+            )
             handlers = self.engine.evaluate_handlers(matched_rules, success=success)
             add_tags    = handlers["add_tags"]
             remove_tags = handlers["remove_tags"]
@@ -1277,27 +1529,38 @@ class Modulator:
             if add_tags or remove_tags:
                 log.info("Tag changes — add=%s remove=%s", add_tags, remove_tags)
 
+            fast_field_note = (
+                f"  {self.engine.fast_module_field}={final_modules_fast}" if self.engine.fast_module_field else ""
+            )
+
             if not self.dry_run:
-                if changed:
-                    self.nb.update_snmp_modules(device.id, final_modules,
-                                                add_tags=add_tags, remove_tags=remove_tags,
-                                                polling_interval=new_interval,
-                                                polling_timeout=new_timeout)
-                    log.info("NetBox updated: snmp_exporter_module=%s", final_modules)
+                if modules_changed:
+                    self.nb.update_snmp_modules(
+                        device.id, final_modules,
+                        add_tags=add_tags, remove_tags=remove_tags,
+                        polling_interval=new_interval, polling_timeout=new_timeout,
+                        fast_modules=final_modules_fast if self.engine.fast_module_field else None,
+                        fast_polling_interval=new_interval_fast, fast_polling_timeout=new_timeout_fast,
+                    )
+                    log.info("NetBox updated: %s=%s%s", self.engine.module_field, final_modules, fast_field_note)
                 else:
                     if add_tags or remove_tags:
                         self.nb.apply_tag_changes(device.id, add_tags, remove_tags)
-                    if new_interval or new_timeout:
-                        self.nb.update_polling(device.id, interval=new_interval, timeout=new_timeout)
+                    if new_interval or new_timeout or new_interval_fast or new_timeout_fast:
+                        self.nb.update_polling(device.id, interval=new_interval, timeout=new_timeout,
+                                               fast_interval=new_interval_fast, fast_timeout=new_timeout_fast)
             else:
-                if changed:
-                    log.info("DRY RUN — would set: snmp_exporter_module=%s", final_modules)
+                if modules_changed:
+                    log.info("DRY RUN — would set: %s=%s%s", self.engine.module_field, final_modules, fast_field_note)
                 if add_tags or remove_tags:
                     log.info("DRY RUN — would update tags: add=%s remove=%s", add_tags, remove_tags)
                 if new_interval or new_timeout:
                     log.info("DRY RUN — would update polling: interval=%s timeout=%s", new_interval, new_timeout)
+                if new_interval_fast or new_timeout_fast:
+                    log.info("DRY RUN — would update polling (fast): interval=%s timeout=%s",
+                             new_interval_fast, new_timeout_fast)
 
-            callbacks.netbox_update(action="changed" if changed else "unchanged")
+            callbacks.netbox_update(action="changed" if modules_changed else "unchanged")
 
             for url in notify_urls:
                 try:
@@ -1311,12 +1574,16 @@ class Modulator:
                 device_name=device.name,
                 previous_modules=previous_modules,
                 final_modules=final_modules,
-                changed=changed,
+                changed=modules_changed,
                 test_results=test_results,
                 auth_profile=resolved_auth,
                 auth_changed=auth_changed,
                 polling_interval=new_interval,
                 polling_timeout=new_timeout,
+                previous_modules_fast=previous_modules_fast,
+                final_modules_fast=final_modules_fast,
+                polling_interval_fast=new_interval_fast,
+                polling_timeout_fast=new_timeout_fast,
                 unreachable=unreachable,
             )
 

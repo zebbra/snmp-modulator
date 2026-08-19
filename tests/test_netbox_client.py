@@ -46,7 +46,11 @@ def _client(devices, matcher=None) -> NetboxClient:
     client._auth_field = "snmp_auth_profile"
     client._interval_field = "snmp_polling_interval"
     client._timeout_field = "snmp_polling_timeout"
+    client._fast_module_field = None
+    client._fast_interval_field = None
+    client._fast_timeout_field = None
     client._valid_modules = None
+    client._valid_modules_fast = None
     return client
 
 
