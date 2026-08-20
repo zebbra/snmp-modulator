@@ -469,6 +469,13 @@ class NetboxClient:
             payload["custom_fields"] = {self._touch_field: date.today().isoformat()}
         dev.update(payload)
 
+    def touch(self, device_id: int) -> None:
+        """Stamp the touch field alone, for a successful reconcile that changed nothing else."""
+        if not self._touch_field:
+            return
+        dev = self.nb.dcim.devices.get(device_id)
+        dev.update({"custom_fields": {self._touch_field: date.today().isoformat()}})
+
     def _compute_tags(self, dev, add_slugs: list, remove_slugs: list) -> list:
         """Compute the new tag list given slugs to add and remove."""
         remove_set = set(remove_slugs)
@@ -1544,11 +1551,16 @@ class Modulator:
                     )
                     log.info("NetBox updated: %s=%s%s", self.engine.module_field, final_modules, fast_field_note)
                 else:
+                    touched = False
                     if add_tags or remove_tags:
                         self.nb.apply_tag_changes(device.id, add_tags, remove_tags)
+                        touched = True
                     if new_interval or new_timeout or new_interval_fast or new_timeout_fast:
                         self.nb.update_polling(device.id, interval=new_interval, timeout=new_timeout,
                                                fast_interval=new_interval_fast, fast_timeout=new_timeout_fast)
+                        touched = True
+                    if not touched and success:
+                        self.nb.touch(device.id)
             else:
                 if modules_changed:
                     log.info("DRY RUN — would set: %s=%s%s", self.engine.module_field, final_modules, fast_field_note)
