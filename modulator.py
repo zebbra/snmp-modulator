@@ -76,16 +76,21 @@ def _round_up_to_step(seconds: float, steps: list) -> int:
 
 def _recommend_polling(probed_durations: list, interval_steps: list, timeout_steps: list,
                         interval_floor_s: int, timeout_floor_s: int,
-                        current_interval: Optional[str], current_timeout: Optional[str],
-                        default_interval: int, default_timeout: int,
+                        cur_interval_s: int, cur_timeout_s: int,
                         label: str, log) -> tuple:
     """Shared normal/fast polling recommendation.
 
     Total probe duration is rounded up to the nearest NetBox choice-set step,
     then raised to at least the resolved floor (global default or a rule's
-    interval/timeout override, whichever is higher). The recommendation is
-    only returned (non-None) when it exceeds the device's current value, so
-    an existing setting never regresses.
+    interval/timeout override, whichever is higher).
+
+    Returns (new_interval, new_timeout, resolved_interval, resolved_timeout):
+    new_* is only non-None when it exceeds the device's current value (so an
+    existing setting never regresses) — that's what gets written to NetBox.
+    resolved_* is always set to whatever is in effect after this run (the new
+    value if one was written, otherwise the current one) — useful for callers
+    that want to report the effective interval/timeout regardless of whether
+    anything actually changed.
     """
     total_s = sum(probed_durations)
     rec_timeout_s  = max(_round_up_to_step(total_s * 1.5, timeout_steps),
@@ -93,18 +98,18 @@ def _recommend_polling(probed_durations: list, interval_steps: list, timeout_ste
     rec_interval_s = max(_round_up_to_step(rec_timeout_s * 2, interval_steps),
                          _round_up_to_step(interval_floor_s, interval_steps))
 
-    cur_timeout_s  = _current_duration_or_default(current_timeout, default_timeout, f"{label} timeout", log)
-    cur_interval_s = _current_duration_or_default(current_interval, default_interval, f"{label} interval", log)
+    resolved_timeout_s  = max(rec_timeout_s, cur_timeout_s)
+    resolved_interval_s = max(rec_interval_s, cur_interval_s)
 
-    new_timeout  = _format_duration(rec_timeout_s)  if rec_timeout_s  > cur_timeout_s  else None
-    new_interval = _format_duration(rec_interval_s) if rec_interval_s > cur_interval_s else None
+    new_timeout  = _format_duration(resolved_timeout_s)  if resolved_timeout_s  > cur_timeout_s  else None
+    new_interval = _format_duration(resolved_interval_s) if resolved_interval_s > cur_interval_s else None
 
     log.info(
         "Polling(%s): total_probe=%.1fs  rec_timeout=%s  rec_interval=%s%s",
         label, total_s, _format_duration(rec_timeout_s), _format_duration(rec_interval_s),
         f"  timeout→{new_timeout}  interval→{new_interval}" if (new_timeout or new_interval) else "  ok",
     )
-    return new_interval, new_timeout
+    return new_interval, new_timeout, _format_duration(resolved_interval_s), _format_duration(resolved_timeout_s)
 
 
 def compare_module_sets(nb_valid_modules: Optional[frozenset], snmp_modules: set) -> tuple:
@@ -156,10 +161,14 @@ class ModulationResult:
     auth_changed: bool = False           # True if auth profile differs from NetBox — written by commit()
     polling_interval: Optional[str] = None   # new interval written to NetBox (None = unchanged)
     polling_timeout:  Optional[str] = None   # new timeout written to NetBox (None = unchanged)
+    resolved_interval: Optional[str] = None  # effective interval after this run, changed or not
+    resolved_timeout:  Optional[str] = None  # effective timeout after this run, changed or not
     previous_modules_fast: list = field(default_factory=list)
     final_modules_fast:    list = field(default_factory=list)
     polling_interval_fast: Optional[str] = None
     polling_timeout_fast:  Optional[str] = None
+    resolved_interval_fast: Optional[str] = None
+    resolved_timeout_fast:  Optional[str] = None
     pending_add_tags:    list = field(default_factory=list)   # on_success/on_fail tags — applied by commit()
     pending_remove_tags: list = field(default_factory=list)
     unreachable: bool = False                # all probes returned useless; existing module list preserved
@@ -1544,36 +1553,55 @@ class Modulator:
             probed_durations_fast = [r.duration_seconds for r in test_results if r.module in final_set_fast]
 
             new_interval = new_timeout = new_interval_fast = new_timeout_fast = None
-            if unreachable:
-                pass  # don't trust durations from a likely-unreachable device
-            else:
-                if self._interval_steps and self._timeout_steps:
-                    new_interval, new_timeout = _recommend_polling(
+            resolved_interval = resolved_timeout = resolved_interval_fast = resolved_timeout_fast = None
+
+            if self._interval_steps and self._timeout_steps:
+                cur_interval_s = _current_duration_or_default(
+                    device.polling_interval, self.engine.default_interval, "polling interval", log
+                )
+                cur_timeout_s = _current_duration_or_default(
+                    device.polling_timeout, self.engine.default_timeout, "polling timeout", log
+                )
+                if unreachable:
+                    # don't trust durations from a likely-unreachable device — report
+                    # what's currently in effect, but don't recommend raising it
+                    resolved_interval = _format_duration(cur_interval_s)
+                    resolved_timeout  = _format_duration(cur_timeout_s)
+                else:
+                    new_interval, new_timeout, resolved_interval, resolved_timeout = _recommend_polling(
                         probed_durations, self._interval_steps, self._timeout_steps,
-                        interval_floor_s, timeout_floor_s,
-                        device.polling_interval, device.polling_timeout,
-                        self.engine.default_interval, self.engine.default_timeout,
+                        interval_floor_s, timeout_floor_s, cur_interval_s, cur_timeout_s,
                         "normal", log,
                     )
-                elif probed_durations:
-                    log.info(
-                        "Polling: total_probe=%.1fs  (calculation skipped — choice set unavailable)",
-                        sum(probed_durations),
-                    )
+            elif probed_durations and not unreachable:
+                log.info(
+                    "Polling: total_probe=%.1fs  (calculation skipped — choice set unavailable)",
+                    sum(probed_durations),
+                )
 
-                if self.engine.fast_module_field and self._fast_interval_steps and self._fast_timeout_steps:
-                    new_interval_fast, new_timeout_fast = _recommend_polling(
-                        probed_durations_fast, self._fast_interval_steps, self._fast_timeout_steps,
-                        fast_interval_floor_s, fast_timeout_floor_s,
-                        device.polling_interval_fast, device.polling_timeout_fast,
-                        self.engine.fast_default_interval, self.engine.fast_default_timeout,
-                        "fast", log,
+            if self.engine.fast_module_field and self._fast_interval_steps and self._fast_timeout_steps:
+                cur_interval_fast_s = _current_duration_or_default(
+                    device.polling_interval_fast, self.engine.fast_default_interval, "fast interval", log
+                )
+                cur_timeout_fast_s = _current_duration_or_default(
+                    device.polling_timeout_fast, self.engine.fast_default_timeout, "fast timeout", log
+                )
+                if unreachable:
+                    resolved_interval_fast = _format_duration(cur_interval_fast_s)
+                    resolved_timeout_fast  = _format_duration(cur_timeout_fast_s)
+                else:
+                    new_interval_fast, new_timeout_fast, resolved_interval_fast, resolved_timeout_fast = (
+                        _recommend_polling(
+                            probed_durations_fast, self._fast_interval_steps, self._fast_timeout_steps,
+                            fast_interval_floor_s, fast_timeout_floor_s, cur_interval_fast_s, cur_timeout_fast_s,
+                            "fast", log,
+                        )
                     )
-                elif probed_durations_fast and self.engine.fast_module_field:
-                    log.info(
-                        "Polling(fast): total_probe=%.1fs  (calculation skipped — choice set unavailable)",
-                        sum(probed_durations_fast),
-                    )
+            elif probed_durations_fast and self.engine.fast_module_field and not unreachable:
+                log.info(
+                    "Polling(fast): total_probe=%.1fs  (calculation skipped — choice set unavailable)",
+                    sum(probed_durations_fast),
+                )
 
             # ── Handlers + NetBox write ───────────────────────────────────────
             # success requires a non-empty final module set (either profile) AND no
@@ -1603,10 +1631,14 @@ class Modulator:
                 auth_changed=auth_changed,
                 polling_interval=new_interval,
                 polling_timeout=new_timeout,
+                resolved_interval=resolved_interval,
+                resolved_timeout=resolved_timeout,
                 previous_modules_fast=previous_modules_fast,
                 final_modules_fast=final_modules_fast,
                 polling_interval_fast=new_interval_fast,
                 polling_timeout_fast=new_timeout_fast,
+                resolved_interval_fast=resolved_interval_fast,
+                resolved_timeout_fast=resolved_timeout_fast,
                 pending_add_tags=add_tags,
                 pending_remove_tags=remove_tags,
                 unreachable=unreachable,

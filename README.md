@@ -496,6 +496,17 @@ modules:
 
 Valid field values: `30s`, `1m`, `90s`, `2m`, `3m`, `4m`, `5m`, `10m`, `15m`.
 
+### Reading the result
+
+`polling_interval`/`polling_timeout` on a `/probe` result (and on `ModulationResult`)
+are `null` unless this run actually wrote a new value — that's "what changed," not
+"what's in effect." For "what's in effect regardless of whether anything changed,"
+use `resolved_interval`/`resolved_timeout` (and their `_fast` counterparts) instead —
+always populated whenever the relevant choice set is configured and fetchable, so a
+`dry_run=true` preview of an already-correctly-configured device still reports real
+numbers instead of nulls. Which modules ended up on the fast profile is in
+`final_modules_fast`, alongside the normal list in `final_modules`.
+
 ### Rule-level interval/timeout floors
 
 `modules.interval` / `modules.timeout` on a rule raise the floor the calculated

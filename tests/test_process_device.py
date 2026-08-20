@@ -489,8 +489,92 @@ def test_rule_interval_floor_raises_recommendation_above_measured_duration(tmp_p
 
     assert result.polling_timeout == "5m"
     assert result.polling_interval == "15m"
+    assert result.resolved_timeout == "5m"
+    assert result.resolved_interval == "15m"
     assert result.final_modules == ["if_mib"]
     assert nb.module_updates == [(1, ["if_mib"], [], [])]
+
+
+def test_resolved_polling_reported_even_when_unchanged(tmp_path) -> None:
+    # polling_interval/timeout stay None when nothing needs writing, but
+    # resolved_interval/timeout should still report the effective value in
+    # place — a caller previewing a device shouldn't see nulls just because
+    # nothing changed.
+    engine = _engine(tmp_path, MAPPING_INTERVAL_FLOOR)
+    nb = FakeNetboxClient()
+    nb.get_polling_step_values = lambda field_name: [30, 60, 120, 180, 300, 600, 900]
+
+    snmp = FakeSnmpExporterClient(
+        modules=["if_mib"],
+        auths=[],
+        probe_results={
+            "if_mib": ModuleTestResult(module="if_mib", useful=True, metric_count=5, duration_seconds=1.0),
+        },
+    )
+    mod = Modulator(nb, snmp, engine, module_policy="drop")
+    dev = _device(
+        current_modules=["if_mib"], snmp_auth_profile="public_v2",
+        polling_interval="15m", polling_timeout="5m",
+    )
+    result = mod.process_device(dev)
+
+    assert result.changed is False
+    assert result.polling_interval is None
+    assert result.polling_timeout is None
+    assert result.resolved_interval == "15m"
+    assert result.resolved_timeout == "5m"
+    assert nb.module_updates == []
+
+
+MAPPING_FAST_POLLING = """
+auth:
+  policy: use
+modules:
+  policy: drop
+  fast:
+    field: snmp_exporter_module_fast
+    interval_field: snmp_polling_interval_fast
+    timeout_field: snmp_polling_timeout_fast
+    default_interval: 1m
+    default_timeout: 20s
+defaults:
+  modules:
+    try: [if_mib]
+rules:
+  - name: fast-rule
+    match: {}
+    modules:
+      fast:
+        try: [if_traffic]
+"""
+
+
+def test_resolved_polling_fast_reported_without_choice_sets(tmp_path) -> None:
+    # No interval_field/timeout_field configured for the normal profile in this
+    # mapping (calculation disabled there), but the fast profile's choice sets
+    # are still available — resolved_interval_fast/timeout_fast should reflect
+    # that independently, and final_modules_fast lists which modules are fast.
+    engine = _engine(tmp_path, MAPPING_FAST_POLLING)
+    nb = FakeNetboxClient()
+    nb.get_polling_step_values = lambda field_name: [30, 60, 120, 300]
+
+    snmp = FakeSnmpExporterClient(
+        modules=["if_mib", "if_traffic"],
+        auths=[],
+        probe_results={
+            "if_mib":     ModuleTestResult(module="if_mib", useful=True, metric_count=5, duration_seconds=0.2),
+            "if_traffic": ModuleTestResult(module="if_traffic", useful=True, metric_count=5, duration_seconds=0.1),
+        },
+    )
+    mod = Modulator(nb, snmp, engine, module_policy="drop")
+    dev = _device(snmp_auth_profile="public_v2")
+    result = mod.process_device(dev)
+
+    assert result.final_modules == ["if_mib"]
+    assert result.final_modules_fast == ["if_traffic"]
+    assert result.resolved_interval is None      # normal profile has no choice sets configured
+    assert result.resolved_interval_fast == "1m"  # falls back to fast_default_interval
+    assert result.resolved_timeout_fast == "30s"  # rounded up from fast_default_timeout (20s)
 
 
 # ── Modulator.commit(): replay a resolved result without re-probing ────────────
