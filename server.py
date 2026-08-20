@@ -28,6 +28,11 @@ so any NetBox API filter is valid:
                    (default 60s) for a free slot, then returns 503 rather than
                    hanging behind an unrelated bulk probe.
   dry_run=true|false   Override the server's dry-run mode for this call only.
+
+Preview-then-confirm: a dry_run=true /probe result for a given host is cached
+for MODULATOR_DRY_RUN_CACHE_TTL seconds (default 300). A plain (non-dry-run)
+/probe call for that *same* host within the window commits the cached result
+for real — no re-probing. One-shot: the cache entry is consumed on that commit.
 """
 
 import asyncio
@@ -80,6 +85,7 @@ from prometheus_client import (
 from prometheus_client.multiprocess import MultiProcessCollector
 
 from modulator import (
+    APP_NAME,
     Callbacks,
     MappingEngine,
     Modulator,
@@ -313,6 +319,18 @@ app = FastAPI(
 _in_flight: set = set()
 _in_flight_lock = threading.Lock()
 
+# Per-process cache of the most recent dry-run result set per job_key. Lets a
+# caller preview with dry_run=true, then confirm with a plain (non-dry-run)
+# call for the *same* query shortly after without re-probing — the previously
+# measured/resolved values are just written for real. One-shot: consumed (and
+# evicted) on the first non-dry-run hit, or dropped once MODULATOR_DRY_RUN_CACHE_TTL
+# elapses. Same per-worker-process caveat as _in_flight above: with
+# MODULATOR_WORKERS>1 this isn't shared across workers, so a commit routed to a
+# different worker than the preview just falls back to a normal re-probe.
+_dry_run_cache: dict = {}
+_dry_run_cache_lock = threading.Lock()
+_DRY_RUN_CACHE_TTL: float = float(os.getenv("MODULATOR_DRY_RUN_CACHE_TTL", "300"))
+
 # NetBox module choices vs snmp-exporter modules — refreshed alongside device counts
 _module_mismatch_lock = threading.Lock()
 _module_mismatch: dict = {"only_in_netbox": [], "only_in_snmp": []}
@@ -440,6 +458,41 @@ def _device_count_loop() -> None:
         time.sleep(_NETBOX_REFRESH_INTERVAL)
 
 
+def _pop_cached_dry_run(job_key: str) -> Optional[list]:
+    """Return and evict a still-fresh cached dry-run result set for job_key, or
+    None if there's nothing cached or it's older than MODULATOR_DRY_RUN_CACHE_TTL.
+    One-shot: a cache hit is consumed, so a repeated confirm doesn't keep
+    replaying an increasingly stale result."""
+    with _dry_run_cache_lock:
+        entry = _dry_run_cache.pop(job_key, None)
+    if entry is None:
+        return None
+    timestamp, results = entry
+    if time.time() - timestamp > _DRY_RUN_CACHE_TTL:
+        return None
+    return results
+
+
+def _cache_dry_run_results(job_key: str, results: list) -> None:
+    with _dry_run_cache_lock:
+        _dry_run_cache[job_key] = (time.time(), results)
+
+
+def _commit_cached_results(results: list) -> list:
+    """Apply the NetBox writes for a previously cached dry-run result set,
+    without re-probing. Mirrors the bookkeeping Modulator.run() would have
+    done for a live, non-dry-run pass over the same devices."""
+    nb, snmp, engine, _ = _make_clients()
+    mod = Modulator(nb, snmp, engine, dry_run=False, device_parallelism=1)
+    callbacks = _ServerCallbacks()
+    for result in results:
+        mod.commit(result, log=logging.getLogger(f"{APP_NAME}.{result.device_name}"))
+        callbacks.netbox_update(action="changed" if result.changed else "unchanged")
+        outcome = "error" if result.error else ("unreachable" if result.unreachable else "success")
+        callbacks.device_processed(outcome)
+    return results
+
+
 def _run_probe(
     job_key: str,
     devices_fn,
@@ -457,10 +510,24 @@ def _run_probe(
     unreachable, etc.): background jobs swallow and log it (False, default);
     wait=true passes True so the caller gets a real error instead of it being
     indistinguishable from "no matching device".
+
+    A non-dry-run call for a job_key with a still-fresh cached dry-run result
+    (see _dry_run_cache above) skips probing entirely and just commits that
+    cached result for real.
     """
     start = time.time()
+    resolved_dry_run = _DRY_RUN if dry_run is None else dry_run
     results: Optional[list] = None
     try:
+        if not resolved_dry_run:
+            cached = _pop_cached_dry_run(job_key)
+            if cached is not None:
+                logger.info(
+                    "Probe job %r: committing %d cached dry-run result(s) — skipping re-probe",
+                    job_key, len(cached),
+                )
+                return _commit_cached_results(cached)
+
         if not _probe_semaphore.acquire(timeout=acquire_timeout):
             return None
         try:
@@ -469,12 +536,14 @@ def _run_probe(
                 nb, snmp, engine, module_policy = _make_clients()
                 mod = Modulator(
                     nb, snmp, engine,
-                    dry_run=_DRY_RUN if dry_run is None else dry_run,
+                    dry_run=resolved_dry_run,
                     module_policy=module_policy,
                     device_parallelism=_DEVICE_PARALLELISM,
                 )
                 devices = devices_fn(nb)
                 results = mod.run(devices, callbacks=_ServerCallbacks())
+                if resolved_dry_run and results:
+                    _cache_dry_run_results(job_key, results)
             except Exception as exc:
                 logger.exception("Probe job %r failed: %s", job_key, exc)
                 if reraise:
@@ -517,6 +586,10 @@ async def probe_host(
     By default returns immediately (202); probe runs in the background.
     Pass `wait=true` to block until it finishes and get the result as JSON —
     e.g. for a NetBox plugin button showing the outcome inline.
+
+    Preview then confirm: after a `dry_run=true` call, a plain call for the
+    same host within MODULATOR_DRY_RUN_CACHE_TTL seconds commits that same
+    result for real instead of re-probing.
     """
     if not host:
         raise HTTPException(status_code=400, detail="host parameter required")
@@ -831,6 +904,8 @@ async def index() -> str:
   <li><code>/probe?host=10.0.0.5</code></li>
   <li><code>/probe?host=switch1.nms.admin.ch</code></li>
   <li><code>/probe?host=10.0.0.5&amp;wait=true&amp;dry_run=true</code> — blocks and returns the result as JSON</li>
+  <li><code>/probe?host=10.0.0.5&amp;wait=true</code> — a plain follow-up call within
+      {int(_DRY_RUN_CACHE_TTL)}s commits the dry run above for real, without re-probing</li>
   <li><code>/probe/netbox?role_id=4&amp;last_updated__lt=2025-10-01</code></li>
   <li><code>/probe/netbox?site=dc1&amp;tag=snmp-ready</code></li>
   <li><code>/probe/netbox?manufacturer=cisco</code></li>

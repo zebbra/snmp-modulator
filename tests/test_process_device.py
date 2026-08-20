@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 
-from modulator import DeviceInfo, MappingEngine, Modulator, ModuleTestResult
+from modulator import DeviceInfo, MappingEngine, ModulationResult, Modulator, ModuleTestResult
 
 
 class FakeNetboxClient:
@@ -28,9 +28,13 @@ class FakeNetboxClient:
         self.polling_updates: list = []
         self.fast_module_updates: list = []
         self.fast_polling_updates: list = []
+        self.touch_calls: list = []
 
     def get_polling_step_values(self, field_name):
         return None
+
+    def touch(self, device_id):
+        self.touch_calls.append(device_id)
 
     def update_auth_profile(self, device_id, profile):
         self.auth_updates.append((device_id, profile))
@@ -486,6 +490,119 @@ def test_rule_interval_floor_raises_recommendation_above_measured_duration(tmp_p
     assert result.polling_timeout == "5m"
     assert result.polling_interval == "15m"
     assert result.final_modules == ["if_mib"]
+    assert nb.module_updates == [(1, ["if_mib"], [], [])]
+
+
+# ── Modulator.commit(): replay a resolved result without re-probing ────────────
+
+MAPPING_COMMIT = """
+auth:
+  policy: use
+modules:
+  policy: drop
+  fast:
+    field: snmp_exporter_module_fast
+defaults:
+  modules:
+    try: [if_mib]
+"""
+
+
+def _commit_modulator(tmp_path) -> tuple:
+    engine = _engine(tmp_path, MAPPING_COMMIT)
+    nb = FakeNetboxClient()
+    snmp = FakeSnmpExporterClient(modules=["if_mib"], auths=[])
+    return Modulator(nb, snmp, engine, module_policy="drop"), nb
+
+
+def test_commit_writes_modules_tags_fast_and_auth_when_changed(tmp_path) -> None:
+    mod, nb = _commit_modulator(tmp_path)
+    result = ModulationResult(
+        device_id=7, device_name="sw1",
+        previous_modules=["if_mib"], final_modules=["if_mib", "entity_sensor"],
+        changed=True, test_results=[],
+        auth_profile="public_v2", auth_changed=True,
+        final_modules_fast=["if_traffic"],
+        pending_add_tags=["snmp-ready"], pending_remove_tags=["discover"],
+    )
+    mod.commit(result)
+
+    assert nb.auth_updates == [(7, "public_v2")]
+    assert nb.module_updates == [(7, ["if_mib", "entity_sensor"], ["snmp-ready"], ["discover"])]
+    assert nb.fast_module_updates == [(7, ["if_traffic"])]
+
+
+def test_commit_applies_tags_only_when_modules_unchanged(tmp_path) -> None:
+    mod, nb = _commit_modulator(tmp_path)
+    result = ModulationResult(
+        device_id=7, device_name="sw1",
+        previous_modules=["if_mib"], final_modules=["if_mib"],
+        changed=False, test_results=[],
+        pending_add_tags=["fixme-snmp"],
+    )
+    mod.commit(result)
+
+    assert nb.tag_updates == [(7, ["fixme-snmp"], [])]
+    assert nb.module_updates == []
+    assert nb.touch_calls == []
+
+
+def test_commit_touches_device_on_pure_noop_success(tmp_path) -> None:
+    mod, nb = _commit_modulator(tmp_path)
+    result = ModulationResult(
+        device_id=7, device_name="sw1",
+        previous_modules=["if_mib"], final_modules=["if_mib"],
+        changed=False,
+        test_results=[ModuleTestResult(module="if_mib", useful=True, metric_count=3, duration_seconds=0.2)],
+    )
+    mod.commit(result)
+
+    assert nb.touch_calls == [7]
+    assert nb.tag_updates == []
+
+
+def test_commit_skips_touch_when_unreachable(tmp_path) -> None:
+    mod, nb = _commit_modulator(tmp_path)
+    result = ModulationResult(
+        device_id=7, device_name="sw1",
+        previous_modules=["if_mib"], final_modules=["if_mib"],
+        changed=False,
+        test_results=[ModuleTestResult(module="if_mib", useful=False, metric_count=0, duration_seconds=0.2)],
+        unreachable=True,
+    )
+    mod.commit(result)
+
+    assert nb.touch_calls == []
+
+
+def test_commit_is_a_noop_on_errored_result(tmp_path) -> None:
+    mod, nb = _commit_modulator(tmp_path)
+    result = ModulationResult(
+        device_id=7, device_name="sw1",
+        previous_modules=[], final_modules=[],
+        changed=False, test_results=[], error="no working auth profile found",
+    )
+    mod.commit(result)
+
+    assert nb.module_updates == [] and nb.tag_updates == [] and nb.auth_updates == [] and nb.touch_calls == []
+
+
+def test_process_device_live_write_matches_commit(tmp_path) -> None:
+    # process_device's non-dry-run path now delegates to commit() — verify the
+    # end-to-end live flow still writes exactly as before the refactor.
+    engine = _engine(tmp_path, MAPPING_COMMIT)
+    nb = FakeNetboxClient()
+    snmp = FakeSnmpExporterClient(
+        modules=["if_mib"],
+        auths=[],
+        probe_results={"if_mib": ModuleTestResult(module="if_mib", useful=True, metric_count=5, duration_seconds=0.3)},
+    )
+    mod = Modulator(nb, snmp, engine, module_policy="drop")
+    dev = _device(snmp_auth_profile="public_v2")
+    result = mod.process_device(dev)
+
+    assert result.final_modules == ["if_mib"]
+    assert result.changed is True
     assert nb.module_updates == [(1, ["if_mib"], [], [])]
 
 

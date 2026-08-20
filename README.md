@@ -392,6 +392,7 @@ Tag changes are batched with the module write when modules changed — one API c
 | `SNMP_EXPORTER_TIMEOUT` | `30` | Per-probe timeout in seconds |
 | `MAPPING_FILE` | `mapping.yaml` | Path to mapping config |
 | `MODULATOR_DRY_RUN` | `false` | Log changes without writing to NetBox |
+| `MODULATOR_DRY_RUN_CACHE_TTL` | `300` | Seconds a dry-run `/probe` result is remembered for; a plain (non-dry-run) `/probe` call for the *same* host within this window commits it for real without re-probing. `0` disables the cache |
 | `MODULATOR_AUTH_TOKEN` | unset | Bearer token for `/probe` endpoints (disabled if unset) |
 | `MODULATOR_PORT` | `8080` | Server listen port |
 | `MODULATOR_WORKERS` | `4` | uvicorn worker count |

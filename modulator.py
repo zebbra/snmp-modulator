@@ -153,13 +153,15 @@ class ModulationResult:
     changed: bool
     test_results: list          # list[ModuleTestResult] — try-modules only
     auth_profile: Optional[str] = None   # resolved auth profile used for probing
-    auth_changed: bool = False           # True if auth profile was written back to NetBox
+    auth_changed: bool = False           # True if auth profile differs from NetBox — written by commit()
     polling_interval: Optional[str] = None   # new interval written to NetBox (None = unchanged)
     polling_timeout:  Optional[str] = None   # new timeout written to NetBox (None = unchanged)
     previous_modules_fast: list = field(default_factory=list)
     final_modules_fast:    list = field(default_factory=list)
     polling_interval_fast: Optional[str] = None
     polling_timeout_fast:  Optional[str] = None
+    pending_add_tags:    list = field(default_factory=list)   # on_success/on_fail tags — applied by commit()
+    pending_remove_tags: list = field(default_factory=list)
     unreachable: bool = False                # all probes returned useless; existing module list preserved
     error: Optional[str] = None
 
@@ -563,7 +565,7 @@ class SnmpExporterClient:
                 module=module,
                 useful=False,
                 metric_count=0,
-                duration_seconds=elapsed,
+                duration_seconds=round(elapsed, 1),
                 error=str(exc),
             )
 
@@ -575,7 +577,7 @@ class SnmpExporterClient:
             module=module,
             useful=useful,
             metric_count=metric_count,
-            duration_seconds=scrape_duration if scrape_duration > 0 else elapsed,
+            duration_seconds=round(scrape_duration if scrape_duration > 0 else elapsed, 1),
         )
 
     def probe_auth(self, target: str, auth: str, canary_module: str) -> bool:
@@ -1197,6 +1199,60 @@ class Modulator:
         else:
             log.info("DRY RUN — would update tags: add=%s remove=%s", add_tags, remove_tags)
 
+    def commit(self, result: ModulationResult, log=None) -> None:
+        """Apply a computed ModulationResult's NetBox writes for real.
+
+        This is the single place that turns a resolved result into actual
+        NetBox API calls — used both by process_device's live (non-dry-run)
+        path, and to replay a previously cached dry-run result later without
+        re-probing (e.g. server.py: preview with dry_run=true, then confirm
+        with a plain, non-dry-run call for the same query shortly after).
+
+        No-op on an errored result — nothing meaningful was resolved.
+        """
+        if result.error:
+            return
+        log = log or logging.getLogger(f"{APP_NAME}.{result.device_name}")
+
+        success = (
+            bool(result.final_modules or result.final_modules_fast)
+            and not any(r.error for r in result.test_results)
+            and not result.unreachable
+        )
+        fast_field_note = (
+            f"  {self.engine.fast_module_field}={result.final_modules_fast}" if self.engine.fast_module_field else ""
+        )
+
+        if result.auth_changed:
+            self.nb.update_auth_profile(result.device_id, result.auth_profile)
+
+        if result.changed:
+            self.nb.update_snmp_modules(
+                result.device_id, result.final_modules,
+                add_tags=result.pending_add_tags, remove_tags=result.pending_remove_tags,
+                polling_interval=result.polling_interval, polling_timeout=result.polling_timeout,
+                fast_modules=result.final_modules_fast if self.engine.fast_module_field else None,
+                fast_polling_interval=result.polling_interval_fast, fast_polling_timeout=result.polling_timeout_fast,
+            )
+            log.info("NetBox updated: %s=%s%s", self.engine.module_field, result.final_modules, fast_field_note)
+        else:
+            touched = False
+            if result.pending_add_tags or result.pending_remove_tags:
+                self.nb.apply_tag_changes(result.device_id, result.pending_add_tags, result.pending_remove_tags)
+                touched = True
+            any_polling = (
+                result.polling_interval or result.polling_timeout
+                or result.polling_interval_fast or result.polling_timeout_fast
+            )
+            if any_polling:
+                self.nb.update_polling(
+                    result.device_id, interval=result.polling_interval, timeout=result.polling_timeout,
+                    fast_interval=result.polling_interval_fast, fast_timeout=result.polling_timeout_fast,
+                )
+                touched = True
+            if not touched and success:
+                self.nb.touch(result.device_id)
+
     def _compare_module_sets(self) -> None:
         """Warn if NetBox module choices and snmp-exporter modules are out of sync."""
         only_in_netbox, only_in_snmp = compare_module_sets(self.nb._valid_modules, set(self.snmp.modules))
@@ -1305,11 +1361,11 @@ class Modulator:
                     )
                 auth_changed  = fixed_auth != device.snmp_auth_profile
                 if auth_changed:
-                    log.info("Auth: rule specifies %r (was %r)", fixed_auth, device.snmp_auth_profile)
-                    if not self.dry_run:
-                        self.nb.update_auth_profile(device.id, fixed_auth)
+                    if self.dry_run:
+                        log.info("DRY RUN — would update auth to %r (was %r)", fixed_auth, device.snmp_auth_profile)
                     else:
-                        log.info("DRY RUN — would update auth to %r", fixed_auth)
+                        log.info("Auth: rule specifies %r (was %r)", fixed_auth, device.snmp_auth_profile)
+                    # actual write deferred to commit() — see its docstring
                 callbacks.auth_probed("skipped")
 
             elif auth_candidates:
@@ -1343,11 +1399,11 @@ class Modulator:
                 callbacks.auth_probed("resolved")
                 auth_changed = resolved_auth != device.snmp_auth_profile
                 if auth_changed:
-                    log.info("Auth: %r → %r", device.snmp_auth_profile, resolved_auth)
-                    if not self.dry_run:
-                        self.nb.update_auth_profile(device.id, resolved_auth)
+                    if self.dry_run:
+                        log.info("DRY RUN — would update auth: %r → %r", device.snmp_auth_profile, resolved_auth)
                     else:
-                        log.info("DRY RUN — would update auth to %r", resolved_auth)
+                        log.info("Auth: %r → %r", device.snmp_auth_profile, resolved_auth)
+                    # actual write deferred to commit() — see its docstring
 
             else:
                 # auth_policy try/drop but no candidates configured
@@ -1415,7 +1471,7 @@ class Modulator:
                 outcome = "error" if result.error else ("useful" if result.useful else "empty")
                 err_str = result.error.split(" for url:")[0] if result.error else ""
                 log.info(
-                    "  %-22s  %-6s  %3d metrics  %.2fs%s",
+                    "  %-22s  %-6s  %3d metrics  %.1fs%s",
                     module, outcome, result.metric_count, result.duration_seconds,
                     f"  {err_str}" if err_str else "",
                 )
@@ -1536,32 +1592,32 @@ class Modulator:
             if add_tags or remove_tags:
                 log.info("Tag changes — add=%s remove=%s", add_tags, remove_tags)
 
-            fast_field_note = (
-                f"  {self.engine.fast_module_field}={final_modules_fast}" if self.engine.fast_module_field else ""
+            result = ModulationResult(
+                device_id=device.id,
+                device_name=device.name,
+                previous_modules=previous_modules,
+                final_modules=final_modules,
+                changed=modules_changed,
+                test_results=test_results,
+                auth_profile=resolved_auth,
+                auth_changed=auth_changed,
+                polling_interval=new_interval,
+                polling_timeout=new_timeout,
+                previous_modules_fast=previous_modules_fast,
+                final_modules_fast=final_modules_fast,
+                polling_interval_fast=new_interval_fast,
+                polling_timeout_fast=new_timeout_fast,
+                pending_add_tags=add_tags,
+                pending_remove_tags=remove_tags,
+                unreachable=unreachable,
             )
 
             if not self.dry_run:
-                if modules_changed:
-                    self.nb.update_snmp_modules(
-                        device.id, final_modules,
-                        add_tags=add_tags, remove_tags=remove_tags,
-                        polling_interval=new_interval, polling_timeout=new_timeout,
-                        fast_modules=final_modules_fast if self.engine.fast_module_field else None,
-                        fast_polling_interval=new_interval_fast, fast_polling_timeout=new_timeout_fast,
-                    )
-                    log.info("NetBox updated: %s=%s%s", self.engine.module_field, final_modules, fast_field_note)
-                else:
-                    touched = False
-                    if add_tags or remove_tags:
-                        self.nb.apply_tag_changes(device.id, add_tags, remove_tags)
-                        touched = True
-                    if new_interval or new_timeout or new_interval_fast or new_timeout_fast:
-                        self.nb.update_polling(device.id, interval=new_interval, timeout=new_timeout,
-                                               fast_interval=new_interval_fast, fast_timeout=new_timeout_fast)
-                        touched = True
-                    if not touched and success:
-                        self.nb.touch(device.id)
+                self.commit(result, log=log)
             else:
+                fast_field_note = (
+                    f"  {self.engine.fast_module_field}={final_modules_fast}" if self.engine.fast_module_field else ""
+                )
                 if modules_changed:
                     log.info("DRY RUN — would set: %s=%s%s", self.engine.module_field, final_modules, fast_field_note)
                 if add_tags or remove_tags:
@@ -1581,23 +1637,7 @@ class Modulator:
                 except Exception as exc:
                     log.warning("Notify %s failed: %s", url, exc)
 
-            return ModulationResult(
-                device_id=device.id,
-                device_name=device.name,
-                previous_modules=previous_modules,
-                final_modules=final_modules,
-                changed=modules_changed,
-                test_results=test_results,
-                auth_profile=resolved_auth,
-                auth_changed=auth_changed,
-                polling_interval=new_interval,
-                polling_timeout=new_timeout,
-                previous_modules_fast=previous_modules_fast,
-                final_modules_fast=final_modules_fast,
-                polling_interval_fast=new_interval_fast,
-                polling_timeout_fast=new_timeout_fast,
-                unreachable=unreachable,
-            )
+            return result
 
         except Exception as exc:
             log.exception("Failed to process %r: %s", device.name, exc)

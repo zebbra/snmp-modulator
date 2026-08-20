@@ -11,6 +11,7 @@ import importlib.util
 import os
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -223,6 +224,95 @@ def test_run_probe_reraises_infra_failure_when_requested(monkeypatch) -> None:
     assert "host:10.0.0.4" not in server._in_flight
     assert server._probe_semaphore.acquire(blocking=False)
     server._probe_semaphore.release()
+
+
+# ── _run_probe: dry-run result cache ────────────────────────────────────────────
+
+def test_run_probe_caches_results_on_dry_run(monkeypatch) -> None:
+    monkeypatch.setattr(
+        server, "_make_clients",
+        lambda: (SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), "drop"),
+    )
+    fake_result = SimpleNamespace(changed=True, error=None, unreachable=False)
+
+    class FakeModulator:
+        def __init__(self, *a, **kw):
+            pass
+
+        def run(self, devices, callbacks=None):
+            return [fake_result]
+
+    monkeypatch.setattr(server, "Modulator", FakeModulator)
+
+    server._run_probe("host:10.0.0.10", lambda nb: ["dev1"], dry_run=True)
+
+    with server._dry_run_cache_lock:
+        assert "host:10.0.0.10" in server._dry_run_cache
+        _, cached = server._dry_run_cache["host:10.0.0.10"]
+        assert cached == [fake_result]
+
+
+def test_run_probe_commits_cached_dry_run_without_reprobing(monkeypatch) -> None:
+    fake_result = SimpleNamespace(
+        device_id=1, device_name="sw1", changed=True, error=None, unreachable=False,
+    )
+    with server._dry_run_cache_lock:
+        server._dry_run_cache["host:10.0.0.11"] = (time.time(), [fake_result])
+
+    committed = []
+
+    class FakeModulator:
+        def __init__(self, *a, **kw):
+            pass
+
+        def run(self, devices, callbacks=None):
+            raise AssertionError("must not re-probe when a fresh dry-run result is cached")
+
+        def commit(self, result, log=None):
+            committed.append(result)
+
+    monkeypatch.setattr(server, "Modulator", FakeModulator)
+    monkeypatch.setattr(
+        server, "_make_clients",
+        lambda: (SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), "drop"),
+    )
+
+    def boom(nb):
+        raise AssertionError("must not fetch devices when replaying a cached result")
+
+    results = server._run_probe("host:10.0.0.11", boom, dry_run=False)
+
+    assert committed == [fake_result]
+    assert results == [fake_result]
+    with server._dry_run_cache_lock:
+        assert "host:10.0.0.11" not in server._dry_run_cache  # one-shot: consumed
+
+
+def test_run_probe_reprobes_when_cached_dry_run_expired(monkeypatch) -> None:
+    fake_result = SimpleNamespace(changed=False, error=None, unreachable=False)
+    with server._dry_run_cache_lock:
+        server._dry_run_cache["host:10.0.0.12"] = (time.time() - server._DRY_RUN_CACHE_TTL - 1, [fake_result])
+
+    monkeypatch.setattr(
+        server, "_make_clients",
+        lambda: (SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), "drop"),
+    )
+
+    ran = []
+
+    class FakeModulator:
+        def __init__(self, *a, **kw):
+            pass
+
+        def run(self, devices, callbacks=None):
+            ran.append(devices)
+            return []
+
+    monkeypatch.setattr(server, "Modulator", FakeModulator)
+
+    server._run_probe("host:10.0.0.12", lambda nb: ["dev1"], dry_run=False)
+
+    assert ran == [["dev1"]]  # expired cache entry ignored — fell through to a real probe
 
 
 # ── _metric_samples / _metric_value ─────────────────────────────────────────────
