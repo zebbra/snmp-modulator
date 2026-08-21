@@ -14,7 +14,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import pynetbox
 import requests
@@ -147,6 +147,7 @@ class ModuleTestResult:
     metric_count: int           # non-housekeeping metrics found
     duration_seconds: float     # scrape_duration_seconds or wall-clock fallback
     error: Optional[str] = None
+    profile: Optional[str] = None   # "normal" | "fast" — which profile tried this module; set by process_device
 
 
 @dataclass
@@ -165,6 +166,8 @@ class ModulationResult:
     resolved_timeout:  Optional[str] = None  # effective timeout after this run, changed or not
     previous_modules_fast: list = field(default_factory=list)
     final_modules_fast:    list = field(default_factory=list)
+    changed_fast: bool = False               # True if final_modules_fast differs from previous_modules_fast
+    fast_profile_enabled: bool = False        # True if modules.fast.field is configured in mapping.yaml
     polling_interval_fast: Optional[str] = None
     polling_timeout_fast:  Optional[str] = None
     resolved_interval_fast: Optional[str] = None
@@ -1278,12 +1281,20 @@ class Modulator:
         self,
         devices: list,
         callbacks: Optional[Callbacks] = None,
+        on_module_result: Optional[Callable[[DeviceInfo, ModuleTestResult], None]] = None,
     ) -> list:
         """Process a list of DeviceInfo objects and return list[ModulationResult].
 
         With device_parallelism > 1, devices are probed concurrently via a
         ThreadPoolExecutor. Per-device log lines remain distinguishable by IP
         because each device gets its own logger.
+
+        on_module_result, if given, fires synchronously right after each
+        module probe completes (module probing itself always stays serial per
+        device — this is purely a way for a caller to observe progress, e.g.
+        server.py surfacing partial results to a polling client while a probe
+        is still in flight). Called with (device, ModuleTestResult); may be
+        invoked from multiple threads at once when device_parallelism > 1.
         """
         if callbacks is None:
             callbacks = Callbacks()
@@ -1294,7 +1305,7 @@ class Modulator:
         )
 
         def _one(device: DeviceInfo) -> ModulationResult:
-            result = self.process_device(device, callbacks)
+            result = self.process_device(device, callbacks, on_module_result=on_module_result)
             if result.error:
                 outcome = "error"
             elif result.unreachable:
@@ -1324,7 +1335,12 @@ class Modulator:
         )
         return results
 
-    def process_device(self, device: DeviceInfo, callbacks: Optional[Callbacks] = None) -> ModulationResult:
+    def process_device(
+        self,
+        device: DeviceInfo,
+        callbacks: Optional[Callbacks] = None,
+        on_module_result: Optional[Callable[[DeviceInfo, ModuleTestResult], None]] = None,
+    ) -> ModulationResult:
         if callbacks is None:
             callbacks = Callbacks()
 
@@ -1476,6 +1492,7 @@ class Modulator:
 
             for module in probe_order:
                 result = active_snmp.probe(device.primary_ip, module, resolved_auth)
+                result.profile = "fast" if module in fast_test_set else "normal"
                 test_results.append(result)
                 outcome = "error" if result.error else ("useful" if result.useful else "empty")
                 err_str = result.error.split(" for url:")[0] if result.error else ""
@@ -1486,6 +1503,8 @@ class Modulator:
                 )
                 callbacks.module_test(module=module, result=outcome)
                 callbacks.module_test_duration(module=module, duration=result.duration_seconds)
+                if on_module_result:
+                    on_module_result(device, result)
 
                 if module == canary_module and result.error:
                     log.warning(
@@ -1635,6 +1654,8 @@ class Modulator:
                 resolved_timeout=resolved_timeout,
                 previous_modules_fast=previous_modules_fast,
                 final_modules_fast=final_modules_fast,
+                changed_fast=changed_fast,
+                fast_profile_enabled=bool(self.engine.fast_module_field),
                 polling_interval_fast=new_interval_fast,
                 polling_timeout_fast=new_timeout_fast,
                 resolved_interval_fast=resolved_interval_fast,

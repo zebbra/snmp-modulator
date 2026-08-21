@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -147,7 +148,7 @@ def test_run_probe_releases_semaphore_and_clears_in_flight(monkeypatch) -> None:
         def __init__(self, *a, **kw):
             pass
 
-        def run(self, devices, callbacks=None):
+        def run(self, devices, callbacks=None, on_module_result=None):
             ran.append(devices)
 
     monkeypatch.setattr(server, "Modulator", FakeModulator)
@@ -175,7 +176,7 @@ def test_run_probe_forwards_dry_run_override_to_modulator(monkeypatch) -> None:
         def __init__(self, *a, **kw):
             seen_kwargs.update(kw)
 
-        def run(self, devices, callbacks=None):
+        def run(self, devices, callbacks=None, on_module_result=None):
             return []
 
     monkeypatch.setattr(server, "Modulator", FakeModulator)
@@ -239,7 +240,7 @@ def test_run_probe_caches_results_on_dry_run(monkeypatch) -> None:
         def __init__(self, *a, **kw):
             pass
 
-        def run(self, devices, callbacks=None):
+        def run(self, devices, callbacks=None, on_module_result=None):
             return [fake_result]
 
     monkeypatch.setattr(server, "Modulator", FakeModulator)
@@ -265,7 +266,7 @@ def test_run_probe_commits_cached_dry_run_without_reprobing(monkeypatch) -> None
         def __init__(self, *a, **kw):
             pass
 
-        def run(self, devices, callbacks=None):
+        def run(self, devices, callbacks=None, on_module_result=None):
             raise AssertionError("must not re-probe when a fresh dry-run result is cached")
 
         def commit(self, result, log=None):
@@ -304,7 +305,7 @@ def test_run_probe_reprobes_when_cached_dry_run_expired(monkeypatch) -> None:
         def __init__(self, *a, **kw):
             pass
 
-        def run(self, devices, callbacks=None):
+        def run(self, devices, callbacks=None, on_module_result=None):
             ran.append(devices)
             return []
 
@@ -313,6 +314,91 @@ def test_run_probe_reprobes_when_cached_dry_run_expired(monkeypatch) -> None:
     server._run_probe("host:10.0.0.12", lambda nb: ["dev1"], dry_run=False)
 
     assert ran == [["dev1"]]  # expired cache entry ignored — fell through to a real probe
+
+
+# ── _run_probe: progress tracking + last-result cache ───────────────────────────
+
+def test_run_probe_records_progress_and_last_result(monkeypatch) -> None:
+    monkeypatch.setattr(
+        server, "_make_clients",
+        lambda: (SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), "drop"),
+    )
+    fake_result = SimpleNamespace(changed=False, error=None, unreachable=False)
+    seen_progress: list = []
+
+    class FakeModulator:
+        def __init__(self, *a, **kw):
+            pass
+
+        def run(self, devices, callbacks=None, on_module_result=None):
+            on_module_result(devices[0], "module-result-1")
+            seen_progress.append(list(server._probe_progress["host:10.0.0.20"]))
+            return [fake_result]
+
+    monkeypatch.setattr(server, "Modulator", FakeModulator)
+
+    server._run_probe("host:10.0.0.20", lambda nb: ["dev1"], dry_run=False)
+
+    assert seen_progress == [["module-result-1"]]  # visible mid-run
+    assert "host:10.0.0.20" not in server._probe_progress  # cleared once finished
+
+    with server._last_result_lock:
+        timestamp, dry_run, results = server._last_result_cache["host:10.0.0.20"]
+    assert dry_run is False
+    assert results == [fake_result]
+
+
+# ── GET /probe/result ────────────────────────────────────────────────────────────
+
+def test_probe_result_404_when_nothing_known(monkeypatch) -> None:
+    with pytest.raises(server.HTTPException) as exc_info:
+        asyncio.run(server.probe_result(host="10.0.0.30"))
+    assert exc_info.value.status_code == 404
+
+
+def test_probe_result_running_reports_partial_progress() -> None:
+    from modulator import ModuleTestResult
+
+    server._in_flight.add("host:10.0.0.31")
+    server._probe_progress["host:10.0.0.31"] = [
+        ModuleTestResult(module="system", useful=True, metric_count=3, duration_seconds=0.2, profile="normal"),
+    ]
+    try:
+        response = asyncio.run(server.probe_result(host="10.0.0.31"))
+        assert response.status_code == 202
+        body = json.loads(response.body)
+        assert body["status"] == "running"
+        assert body["result"]["test_results"][0]["module"] == "system"
+        assert body["result"]["final_modules"] == []  # not known yet, but key is present
+    finally:
+        server._in_flight.discard("host:10.0.0.31")
+        server._probe_progress.pop("host:10.0.0.31", None)
+
+
+def test_probe_result_done_reports_full_result() -> None:
+    from modulator import ModulationResult
+
+    result = ModulationResult(
+        device_id=1, device_name="sw1",
+        previous_modules=[], final_modules=["if_full"], changed=True, test_results=[],
+    )
+    with server._last_result_lock:
+        server._last_result_cache["host:10.0.0.32"] = (time.time(), True, [result])
+
+    response = asyncio.run(server.probe_result(host="10.0.0.32"))
+    assert response == {"status": "done", "host": "10.0.0.32", "dry_run": True, "result": server.asdict(result)}
+
+
+def test_probe_result_404_when_last_result_expired() -> None:
+    result = SimpleNamespace(changed=True, error=None, unreachable=False)
+    with server._last_result_lock:
+        server._last_result_cache["host:10.0.0.33"] = (
+            time.time() - server._PROBE_RESULT_TTL - 1, False, [result],
+        )
+
+    with pytest.raises(server.HTTPException) as exc_info:
+        asyncio.run(server.probe_result(host="10.0.0.33"))
+    assert exc_info.value.status_code == 404
 
 
 # ── _metric_samples / _metric_value ─────────────────────────────────────────────

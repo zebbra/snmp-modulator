@@ -88,6 +88,7 @@ from modulator import (
     APP_NAME,
     Callbacks,
     MappingEngine,
+    ModulationResult,
     Modulator,
     NetboxClient,
     SnmpExporterClient,
@@ -331,6 +332,23 @@ _dry_run_cache: dict = {}
 _dry_run_cache_lock = threading.Lock()
 _DRY_RUN_CACHE_TTL: float = float(os.getenv("MODULATOR_DRY_RUN_CACHE_TTL", "300"))
 
+# Live per-job progress (module test results completed so far) while a probe is
+# still in flight (job_key in _in_flight) — lets GET /probe/result show partial
+# progress instead of a caller having to hold one long request open for the
+# whole (serial, per-device) probe duration. Reset when a job starts, appended
+# to as each module completes, cleared when the job finishes.
+_probe_progress: dict = {}
+_probe_progress_lock = threading.Lock()
+
+# Last completed result per job_key, for every run (dry_run or not) — unlike
+# _dry_run_cache this is NOT one-shot; GET /probe/result just reads it,
+# repeatedly, until it's overwritten by that job_key's next run or
+# MODULATOR_PROBE_RESULT_TTL elapses. Same per-worker-process caveat as
+# _in_flight above.
+_last_result_cache: dict = {}
+_last_result_lock = threading.Lock()
+_PROBE_RESULT_TTL: float = float(os.getenv("MODULATOR_PROBE_RESULT_TTL", "300"))
+
 # NetBox module choices vs snmp-exporter modules — refreshed alongside device counts
 _module_mismatch_lock = threading.Lock()
 _module_mismatch: dict = {"only_in_netbox": [], "only_in_snmp": []}
@@ -478,6 +496,16 @@ def _cache_dry_run_results(job_key: str, results: list) -> None:
         _dry_run_cache[job_key] = (time.time(), results)
 
 
+def _record_module_progress(job_key: str, result) -> None:
+    with _probe_progress_lock:
+        _probe_progress.setdefault(job_key, []).append(result)
+
+
+def _cache_last_result(job_key: str, dry_run: bool, results: list) -> None:
+    with _last_result_lock:
+        _last_result_cache[job_key] = (time.time(), dry_run, results)
+
+
 def _commit_cached_results(results: list) -> list:
     """Apply the NetBox writes for a previously cached dry-run result set,
     without re-probing. Mirrors the bookkeeping Modulator.run() would have
@@ -532,6 +560,8 @@ def _run_probe(
             return None
         try:
             probe_in_progress.inc()
+            with _probe_progress_lock:
+                _probe_progress[job_key] = []
             try:
                 nb, snmp, engine, module_policy = _make_clients()
                 mod = Modulator(
@@ -541,9 +571,13 @@ def _run_probe(
                     device_parallelism=_DEVICE_PARALLELISM,
                 )
                 devices = devices_fn(nb)
-                results = mod.run(devices, callbacks=_ServerCallbacks())
+                results = mod.run(
+                    devices, callbacks=_ServerCallbacks(),
+                    on_module_result=lambda device, result: _record_module_progress(job_key, result),
+                )
                 if resolved_dry_run and results:
                     _cache_dry_run_results(job_key, results)
+                _cache_last_result(job_key, resolved_dry_run, results if results else [])
             except Exception as exc:
                 logger.exception("Probe job %r failed: %s", job_key, exc)
                 if reraise:
@@ -557,6 +591,8 @@ def _run_probe(
     finally:
         with _in_flight_lock:
             _in_flight.discard(job_key)
+        with _probe_progress_lock:
+            _probe_progress.pop(job_key, None)
         probe_jobs_in_flight.dec()
         logger.info("Probe job %r finished in %.1fs", job_key, time.time() - start)
     return results
@@ -638,6 +674,64 @@ async def probe_host(
     background_tasks.add_task(_run_probe, job_key, fetch, dry_run)
     logger.info("Probe queued for host %r", host)
     return JSONResponse(status_code=202, content={"status": "queued", "host": host})
+
+
+@app.get(
+    "/probe/result",
+    dependencies=[Depends(require_auth)],
+    summary="Poll for a queued probe's progress or finished result",
+)
+async def probe_result(
+    host: Annotated[Optional[str], Query(description="Device IP or name — same value passed to /probe")] = None,
+) -> Any:
+    """
+    Poll this after kicking off a background `/probe?host=<host>` call (the
+    default, non-`wait=true` mode) — avoids holding one HTTP request open for
+    the whole probe duration, which is unavoidably serial per device (modules
+    on one device are always probed one at a time, never in parallel, so it
+    can't be sped up — this just avoids blocking on it).
+
+    Keyed by `host`, same as `/probe` — no job id to track client-side, just
+    re-GET this with the same host param until `status` is `"done"`.
+
+    `result` has the same shape in both states (an asdict'd `ModulationResult`)
+    so a caller's rendering doesn't need to branch: while running, only
+    `test_results` (modules probed so far) is populated; once done, every
+    field is.
+
+    Returns 202 while running, 200 once done, 404 if no probe for this host
+    is in flight or was recently completed (nothing to report — submit one).
+    """
+    if not host:
+        raise HTTPException(status_code=400, detail="host parameter required")
+    job_key = f"host:{host}"
+
+    with _in_flight_lock:
+        running = job_key in _in_flight
+
+    if running:
+        with _probe_progress_lock:
+            partial_results = list(_probe_progress.get(job_key, []))
+        stub = ModulationResult(
+            device_id=0, device_name=host,
+            previous_modules=[], final_modules=[], changed=False,
+            test_results=partial_results,
+        )
+        return JSONResponse(
+            status_code=202,
+            content={"status": "running", "host": host, "result": asdict(stub)},
+        )
+
+    with _last_result_lock:
+        entry = _last_result_cache.get(job_key)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"no probe found for {host!r} — submit one first")
+    timestamp, dry_run, results = entry
+    if time.time() - timestamp > _PROBE_RESULT_TTL:
+        raise HTTPException(status_code=404, detail=f"probe result for {host!r} expired — submit a new one")
+    if not results:
+        raise HTTPException(status_code=404, detail=f"host {host!r} not found in NetBox or ineligible")
+    return {"status": "done", "host": host, "dry_run": dry_run, "result": asdict(results[0])}
 
 
 @app.api_route(

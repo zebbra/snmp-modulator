@@ -393,6 +393,7 @@ Tag changes are batched with the module write when modules changed — one API c
 | `MAPPING_FILE` | `mapping.yaml` | Path to mapping config |
 | `MODULATOR_DRY_RUN` | `false` | Log changes without writing to NetBox |
 | `MODULATOR_DRY_RUN_CACHE_TTL` | `300` | Seconds a dry-run `/probe` result is remembered for; a plain (non-dry-run) `/probe` call for the *same* host within this window commits it for real without re-probing. `0` disables the cache |
+| `MODULATOR_PROBE_RESULT_TTL` | `300` | Seconds a finished probe result stays available via `GET /probe/result?host=X` before that endpoint 404s and a new probe must be submitted |
 | `MODULATOR_AUTH_TOKEN` | unset | Bearer token for `/probe` endpoints (disabled if unset) |
 | `MODULATOR_PORT` | `8080` | Server listen port |
 | `MODULATOR_WORKERS` | `4` | uvicorn worker count |
@@ -432,6 +433,7 @@ Options:
 | Endpoint | Description |
 |---|---|
 | `GET/POST /probe?host=<ip\|name>` | Probe a single device |
+| `GET /probe/result?host=<ip\|name>` | Poll a queued probe's progress or finished result |
 | `GET/POST /probe/netbox?<filter>` | Probe devices matching any NetBox filter |
 | `GET /health` | Liveness check |
 | `GET /metrics` | Prometheus metrics |
@@ -444,6 +446,30 @@ NetBox filter params are passed directly to `dcim.devices.filter()`:
 /probe/netbox?manufacturer=cisco&last_updated__lt=2025-10-01
 /probe/netbox?tag=discover
 ```
+
+### Polling instead of `wait=true`
+
+Module probing on a single device is always serial — never parallel, that risks
+overloading fragile devices — so a device with several slow modules can take
+well past a typical HTTP/proxy timeout if you hold `/probe?wait=true` open for
+the whole thing. `GET /probe/result?host=<same host>` avoids that: submit with
+the default fire-and-forget mode (`POST /probe?host=X`, returns 202 instantly),
+then poll `/probe/result?host=X` every second or two instead of blocking one
+request:
+
+```
+GET /probe/result?host=10.0.0.5
+  -> 202 {"status": "running", "host": ..., "result": {"test_results": [...], ...}}
+  -> 200 {"status": "done",    "host": ..., "dry_run": ..., "result": {...full ModulationResult}}
+  -> 404 no probe found for this host — submit one first, or it expired (MODULATOR_PROBE_RESULT_TTL)
+```
+
+`result` has the **same shape** in both states — while running, only
+`test_results` (modules probed so far, each tagged `profile: "normal"|"fast"`)
+is populated; everything else is null/empty until `status` flips to `"done"`.
+Keyed by `host`, same as `/probe` — no job id to track, just re-GET the same
+URL. `MODULATOR_PROBE_RESULT_TTL` (default 300s) controls how long a finished
+result stays available to poll for.
 
 ---
 
