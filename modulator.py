@@ -7,7 +7,7 @@ the snmp_exporter_module custom field with only modules that return
 useful data (per the mapping YAML).
 """
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 import logging
 import re
