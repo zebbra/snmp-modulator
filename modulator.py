@@ -161,7 +161,7 @@ class DeviceInfo:
 class ModuleTestResult:
     module: str
     useful: bool
-    metric_count: int           # non-housekeeping metrics found
+    metric_count: int           # non-housekeeping data rows returned (every label combo, not deduped by name)
     duration_seconds: float     # scrape_duration_seconds or wall-clock fallback
     error: Optional[str] = None
     profile: Optional[str] = None   # "normal" | "fast" — which profile tried this module; set by process_device
@@ -599,8 +599,8 @@ class SnmpExporterClient:
             )
 
         elapsed = time.monotonic() - t0
-        metrics = self._parse(resp.text)
-        useful, metric_count, scrape_duration = self._evaluate(metrics)
+        first_seen, row_names = self._parse(resp.text)
+        useful, metric_count, scrape_duration = self._evaluate(first_seen, row_names)
 
         return ModuleTestResult(
             module=module,
@@ -626,23 +626,31 @@ class SnmpExporterClient:
             body = resp.text.strip().splitlines()[0] if resp.text else ""
             logger.debug("probe_auth %r: HTTP %d — %s", auth, resp.status_code, body[:200])
             return False
-        metrics = self._parse(resp.text)
-        up = metrics.get("up", 0.0)
-        useful, useful_count, _ = self._evaluate(metrics)
-        logger.debug("probe_auth %r: up=%s  useful=%d  metrics=%d",
-                     auth, up, useful_count, len(metrics))
+        first_seen, row_names = self._parse(resp.text)
+        up = first_seen.get("up", 0.0)
+        useful, useful_count, _ = self._evaluate(first_seen, row_names)
+        logger.debug("probe_auth %r: up=%s  useful=%d  rows=%d",
+                     auth, up, useful_count, len(row_names))
         return up == 1.0 or useful
 
     @staticmethod
-    def _parse(text: str) -> dict:
+    def _parse(text: str) -> tuple:
         """
-        Parse Prometheus text exposition format into {metric_name: first_seen_value}.
+        Parse Prometheus text exposition format.
 
-        Strips label sets, skips comments and non-numeric values (string metrics
-        like ifDescr).  Only the first occurrence of each metric family is kept —
-        we care about presence, not cardinality.
+        Strips label sets, skips comments and non-numeric values (string
+        metrics like ifDescr). Returns (first_seen, row_names):
+          first_seen — {metric_name: first_seen_value}, one entry per metric
+            family — for looking up scalar/singleton values like `up` or
+            `scrape_duration_seconds`, where cardinality is 1 by nature.
+          row_names — the metric name of every numeric data row parsed, in
+            order, including every repeated family across all its label
+            combinations (e.g. one ifOperStatus entry per interface) — for
+            counting actual returned data volume, not just which metric
+            families were present.
         """
-        metrics: dict = {}
+        first_seen: dict = {}
+        row_names: list = []
         for line in text.splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
@@ -664,26 +672,31 @@ class SnmpExporterClient:
             except (ValueError, IndexError):
                 continue  # string-valued metric (ifDescr etc.) — skip
 
-            if name not in metrics:
-                metrics[name] = value
+            if name not in first_seen:
+                first_seen[name] = value
+            row_names.append(name)
 
-        return metrics
+        return first_seen, row_names
 
     @staticmethod
-    def _evaluate(metrics: dict) -> tuple:
+    def _evaluate(first_seen: dict, row_names: list) -> tuple:
         """
-        Returns (useful, useful_metric_count, scrape_duration_seconds).
+        Returns (useful, data_row_count, scrape_duration_seconds).
 
-        Useful = any metric that is not in the housekeeping set and does not
-        start with "snmp_scrape_" (snmp-exporter internal walk metrics).
+        data_row_count is the total number of returned data rows (every label
+        combination, e.g. one per interface) that aren't housekeeping metrics
+        or snmp-exporter's internal "snmp_scrape_*" walk-progress metrics —
+        i.e. actual returned SNMP data volume, not just how many distinct
+        metric names were present.
+
+        useful = data_row_count > 0.
         """
-        useful_count = sum(
-            1 for name in metrics
-            if name not in _HOUSEKEEPING_METRICS
-            and not name.startswith("snmp_scrape_")
-        )
-        scrape_duration = metrics.get("scrape_duration_seconds", 0.0)
-        return useful_count > 0, useful_count, scrape_duration
+        def _is_data_row(name: str) -> bool:
+            return name not in _HOUSEKEEPING_METRICS and not name.startswith("snmp_scrape_")
+
+        data_row_count = sum(1 for name in row_names if _is_data_row(name))
+        scrape_duration = first_seen.get("scrape_duration_seconds", 0.0)
+        return data_row_count > 0, data_row_count, scrape_duration
 
 
 # ── Mapping engine ────────────────────────────────────────────────────────────
