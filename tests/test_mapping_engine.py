@@ -125,6 +125,36 @@ def test_evaluate_all_in_try_expands_to_known_modules(tmp_path) -> None:
     assert test_set == {"if_mib", "cisco_ios"}
 
 
+# ── evaluate(): modules unknown to snmp-exporter are dropped ────────────────────
+
+MAPPING_UNKNOWN_MODULE = """
+modules:
+  policy: drop
+defaults:
+  modules:
+    add: [typo_module_add]
+    try: [if_mib, typo_module_try]
+"""
+
+
+def test_evaluate_drops_module_unknown_to_snmp_exporter(tmp_path) -> None:
+    engine = _engine(tmp_path, MAPPING_UNKNOWN_MODULE)
+    dev = _device()
+    unconditional, test_set, _, _, _ = engine.evaluate(dev, known_modules=["if_mib"])
+    assert unconditional == set()          # typo_module_add isn't a real module — dropped
+    assert test_set == {"if_mib"}          # typo_module_try dropped, if_mib kept
+
+
+def test_evaluate_keeps_everything_when_known_modules_unavailable(tmp_path) -> None:
+    # snmp-exporter /config failed to load (known_modules empty) — don't let a
+    # transient fetch failure silently drop every configured module.
+    engine = _engine(tmp_path, MAPPING_UNKNOWN_MODULE)
+    dev = _device()
+    unconditional, test_set, _, _, _ = engine.evaluate(dev, known_modules=[])
+    assert unconditional == {"typo_module_add"}
+    assert test_set == {"if_mib", "typo_module_try"}
+
+
 MAPPING_BLOCK_ALL = """
 modules:
   policy: drop
@@ -403,6 +433,21 @@ rules:
     assert unconditional == {"if_traffic_fast_add"}
     assert test_set == {"if_traffic"}
     assert block_set == {"if_full"}
+
+
+def test_evaluate_fast_drops_module_unknown_to_snmp_exporter(tmp_path) -> None:
+    engine = _engine(tmp_path, MAPPING_FAST_CONFIG + """
+rules:
+  - name: fast-rule
+    match: {}
+    modules:
+      fast:
+        try: [if_traffic, typo_module_fast]
+""")
+    dev = _device()
+    _, _, _, _, matched_rules = engine.evaluate(dev, known_modules=[])
+    _, test_set, _ = engine.evaluate_fast(dev, matched_rules, known_modules=["if_traffic"])
+    assert test_set == {"if_traffic"}
 
 
 def test_resolve_polling_floors_takes_max_across_matched_rules_and_default(tmp_path) -> None:

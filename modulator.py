@@ -112,6 +112,23 @@ def _recommend_polling(probed_durations: list, interval_steps: list, timeout_ste
     return new_interval, new_timeout, _format_duration(resolved_interval_s), _format_duration(resolved_timeout_s)
 
 
+def _drop_unknown_modules(unconditional: set, test: set, known_modules, label: str) -> tuple:
+    """Drop modules mapping.yaml references that snmp-exporter doesn't actually
+    know about (per /config) — a typo'd or stale module name would otherwise
+    either waste a doomed probe (try) or get written to NetBox for a module
+    that can never be scraped (add). No-op when known_modules is empty
+    (snmp-exporter /config not loaded yet) — better to attempt everything than
+    to have a transient fetch failure silently drop every module.
+    """
+    if not known_modules:
+        return unconditional, test
+    known = set(known_modules)
+    unknown = (unconditional | test) - known
+    if unknown:
+        logger.warning("%s module(s) not known to snmp-exporter — skipping: %s", label, sorted(unknown))
+    return unconditional & known, test & known
+
+
 def compare_module_sets(nb_valid_modules: Optional[frozenset], snmp_modules: set) -> tuple:
     """Diff NetBox's module choice set against snmp-exporter's known modules.
 
@@ -862,6 +879,7 @@ class MappingEngine:
           4. _ALL in test  → expand to known_modules (from snmp-exporter /config)
           5. Normal per-module block veto applied
           6. unconditional modules removed from test (no point testing what's always added)
+          7. Modules unknown to snmp-exporter (per known_modules) dropped from both sets
 
         matched_rules is the list of matching rule dicts — passed to evaluate_handlers
         to avoid re-walking rules a second time.
@@ -898,6 +916,8 @@ class MappingEngine:
         test -= block
         test -= unconditional  # already added unconditionally — no need to probe
 
+        unconditional, test = _drop_unknown_modules(unconditional, test, known_modules, "mapping")
+
         return unconditional, test, block, matched_names, matched_rules
 
     def evaluate_fast(self, device: DeviceInfo, matched_rules: list, known_modules: list = ()) -> tuple:
@@ -933,6 +953,9 @@ class MappingEngine:
         unconditional -= block
         test -= block
         test -= unconditional
+
+        unconditional, test = _drop_unknown_modules(unconditional, test, known_modules, "fast mapping")
+
         return unconditional, test, block
 
     def resolve_polling_floors(self, matched_rules: list) -> tuple:

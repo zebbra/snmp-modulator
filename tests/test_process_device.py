@@ -284,6 +284,47 @@ def test_canary_failure_skips_remaining_module_probes(tmp_path) -> None:
     assert nb.module_updates == []
 
 
+# ── modules unknown to snmp-exporter are skipped, not probed ───────────────────
+
+MAPPING_UNKNOWN_MODULE = """
+auth:
+  policy: use
+modules:
+  policy: drop
+defaults:
+  modules:
+    add: [typo_module_add]
+    try: [if_mib, typo_module_try]
+"""
+
+
+def test_module_unknown_to_snmp_exporter_is_never_probed(tmp_path) -> None:
+    engine = _engine(tmp_path, MAPPING_UNKNOWN_MODULE)
+    nb = FakeNetboxClient()
+
+    probed: list = []
+
+    class TrackingSnmp(FakeSnmpExporterClient):
+        def probe(self, target, module, auth):
+            probed.append(module)
+            return super().probe(target, module, auth)
+
+    snmp = TrackingSnmp(
+        modules=["if_mib"],  # snmp-exporter has never heard of typo_module_add/try
+        auths=[],
+        probe_results={
+            "if_mib": ModuleTestResult(module="if_mib", useful=True, metric_count=5, duration_seconds=0.2),
+        },
+    )
+    mod = Modulator(nb, snmp, engine, module_policy="drop")
+    dev = _device(snmp_auth_profile="public_v2")
+    result = mod.process_device(dev)
+
+    assert probed == ["if_mib"]  # typo_module_try never sent to snmp-exporter
+    assert result.final_modules == ["if_mib"]  # typo_module_add never written either
+    assert nb.module_updates == [(1, ["if_mib"], [], [])]
+
+
 # ── stale/unparseable existing polling field must not abort the device ────────
 
 MAPPING_POLLING = """

@@ -375,8 +375,14 @@ Tag changes are batched with the module write when modules changed — one API c
    - `_ALL` in `block` → return empty immediately, skip remaining steps
    - `_ALL` in `try` → expand to every module from snmp-exporter `/config`
 3. `block` veto: remove from `add` and `try`
-4. Probe each `try` module; keep those returning useful data
-5. Final: `sorted(add ∪ useful_try)`
+4. Drop any module name not known to snmp-exporter (per `/config`) from both `add`
+   and `try` — a typo'd or stale module name in mapping.yaml would otherwise waste
+   a doomed probe, or get written to NetBox for a module that can never be
+   scraped. Logged as a warning. Skipped entirely (nothing dropped) if
+   snmp-exporter's `/config` failed to load — better to attempt everything than
+   have a transient fetch failure silently wipe every module.
+5. Probe each `try` module; keep those returning useful data
+6. Final: `sorted(add ∪ useful_try)`
 
 ---
 
