@@ -47,6 +47,8 @@ class FakeNetboxClient:
                             fast_modules=None, fast_polling_interval=None, fast_polling_timeout=None):
         self.module_updates.append((device_id, list(modules), list(add_tags), list(remove_tags)))
         self.fast_module_updates.append((device_id, list(fast_modules) if fast_modules is not None else None))
+        self.polling_updates.append((device_id, polling_interval, polling_timeout))
+        self.fast_polling_updates.append((device_id, fast_polling_interval, fast_polling_timeout))
 
     def update_polling(self, device_id, interval=None, timeout=None, fast_interval=None, fast_timeout=None):
         self.polling_updates.append((device_id, interval, timeout))
@@ -533,7 +535,60 @@ def test_rule_interval_floor_raises_recommendation_above_measured_duration(tmp_p
     assert result.resolved_timeout == "5m"
     assert result.resolved_interval == "15m"
     assert result.final_modules == ["if_mib"]
+    # module list also changed here — verify the recommendation actually reaches
+    # the NetBox write call, not just the returned result object.
+    assert nb.polling_updates == [(1, "15m", "5m")]
     assert nb.module_updates == [(1, ["if_mib"], [], [])]
+
+
+def test_interval_recovers_down_after_a_prior_slow_probe_inflated_it(tmp_path) -> None:
+    # A previous run's slow probe pushed the device to 1h. This run's probe is
+    # fast again — the recommendation must come back down to the mapping.yaml
+    # floor (15m), not stay pinned at 1h forever just because 1h is currently
+    # in NetBox and higher than the floor.
+    engine = _engine(tmp_path, MAPPING_INTERVAL_FLOOR)
+    nb = FakeNetboxClient()
+    nb.get_polling_step_values = lambda field_name: [30, 60, 120, 180, 300, 600, 900, 3600]
+
+    snmp = FakeSnmpExporterClient(
+        modules=["if_mib"],
+        auths=[],
+        probe_results={
+            "if_mib": ModuleTestResult(module="if_mib", useful=True, metric_count=5, duration_seconds=1.0),
+        },
+    )
+    mod = Modulator(nb, snmp, engine, module_policy="drop")
+    dev = _device(
+        current_modules=["if_mib"], snmp_auth_profile="public_v2",
+        polling_interval="1h", polling_timeout="5m",
+    )
+    result = mod.process_device(dev)
+
+    assert result.polling_interval == "15m"   # decreased back to the floor
+    assert result.polling_timeout is None      # already at the floor — no change needed
+    assert result.resolved_interval == "15m"
+    assert nb.polling_updates == [(1, "15m", None)]
+
+
+def test_interval_never_drops_below_the_configured_floor(tmp_path) -> None:
+    # Even an instant probe can't push the recommendation below the floor.
+    engine = _engine(tmp_path, MAPPING_INTERVAL_FLOOR)
+    nb = FakeNetboxClient()
+    nb.get_polling_step_values = lambda field_name: [30, 60, 120, 180, 300, 600, 900, 3600]
+
+    snmp = FakeSnmpExporterClient(
+        modules=["if_mib"],
+        auths=[],
+        probe_results={
+            "if_mib": ModuleTestResult(module="if_mib", useful=True, metric_count=5, duration_seconds=0.0),
+        },
+    )
+    mod = Modulator(nb, snmp, engine, module_policy="drop")
+    dev = _device(current_modules=["if_mib"], snmp_auth_profile="public_v2")
+    result = mod.process_device(dev)
+
+    assert result.resolved_interval == "15m"
+    assert result.resolved_timeout == "5m"
 
 
 def test_resolved_polling_reported_even_when_unchanged(tmp_path) -> None:
@@ -729,6 +784,67 @@ def test_process_device_live_write_matches_commit(tmp_path) -> None:
     assert result.final_modules == ["if_mib"]
     assert result.changed is True
     assert nb.module_updates == [(1, ["if_mib"], [], [])]
+
+
+MAPPING_BOTH_PROFILES_FLOOR = """
+auth:
+  policy: use
+modules:
+  policy: drop
+  interval_field: snmp_polling_interval
+  timeout_field: snmp_polling_timeout
+  default_interval: 5m
+  default_timeout: 2m
+  fast:
+    field: snmp_exporter_module_fast
+    interval_field: snmp_polling_interval_fast
+    timeout_field: snmp_polling_timeout_fast
+    default_interval: 1m
+    default_timeout: 20s
+defaults:
+  modules:
+    try: [system]
+rules:
+  - name: group-specific
+    match: {}
+    modules:
+      interval: 15m
+      fast:
+        interval: 5m
+        try: [if_traffic]
+"""
+
+
+def test_normal_and_fast_polling_both_written_when_modules_change(tmp_path) -> None:
+    # Regression check: a device matching rules with distinct normal/fast
+    # interval floors and a changed module list must get BOTH profiles'
+    # polling_interval/timeout in the actual NetBox write, not just one.
+    engine = _engine(tmp_path, MAPPING_BOTH_PROFILES_FLOOR)
+    nb = FakeNetboxClient()
+    nb.get_polling_step_values = lambda field_name: [30, 60, 90, 120, 180, 240, 300, 600, 900]
+
+    snmp = FakeSnmpExporterClient(
+        modules=["system", "if_traffic"],
+        auths=[],
+        probe_results={
+            "system":     ModuleTestResult(module="system", useful=True, metric_count=8, duration_seconds=9.5),
+            "if_traffic": ModuleTestResult(module="if_traffic", useful=True, metric_count=2, duration_seconds=0.0),
+        },
+    )
+    mod = Modulator(nb, snmp, engine, module_policy="drop")
+    dev = _device(snmp_auth_profile="public_v2")
+    result = mod.process_device(dev)
+
+    assert result.final_modules == ["system"]
+    assert result.final_modules_fast == ["if_traffic"]
+    assert result.polling_interval == "15m"
+    assert result.polling_interval_fast == "5m"
+    assert nb.module_updates == [(1, ["system"], [], [])]
+    assert nb.fast_module_updates == [(1, ["if_traffic"])]
+    # This is the exact bug report: verify BOTH interval writes actually reach
+    # the NetBox call, not just the returned ModulationResult fields.
+    assert nb.polling_updates == [(1, "15m", result.polling_timeout)]
+    assert nb.fast_polling_updates == [(1, "5m", result.polling_timeout_fast)]
 
 
 if __name__ == "__main__":

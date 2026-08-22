@@ -517,8 +517,13 @@ The step ladders are read from the NetBox selection custom fields (`snmp_polling
 Only modules that made it into the final set contribute to `total` — probed modules that returned
 no useful data are excluded. Unconditional (`add`) modules are also excluded since they are not probed.
 
-The field is only written if the calculated value is **higher** than the current NetBox value.
-If the field is empty, the defaults from `mapping.yaml` are used as the baseline:
+The field is written whenever the calculated value **differs** from the current NetBox
+value — in either direction. The floor (global default, or a rule's `interval`/`timeout`
+override — see below) is the only lower bound; a device's *current* NetBox value is not.
+That's deliberate: if one unlucky slow probe pushes a device's interval up to `1h`, the
+next normal-speed probe recovers it back down to its real floor instead of leaving it
+stuck at `1h` forever just because `1h` happens to be higher than the floor. If the field
+is empty, the defaults from `mapping.yaml` are used as the baseline:
 
 ```yaml
 modules:
@@ -542,12 +547,14 @@ numbers instead of nulls. Which modules ended up on the fast profile is in
 ### Rule-level interval/timeout floors
 
 `modules.interval` / `modules.timeout` on a rule raise the floor the calculated
-recommendation is compared against, on top of `default_interval`/`default_timeout`.
-When multiple matching rules set a floor, the highest wins. Unlike the "only write
-if higher than current" check above, the floor applies to the *recommendation itself* —
-so a rule can force a slow/rarely-changing device to a longer interval even if it
-happens to answer probes quickly (e.g. a remote site over a WAN link where fast
-polling isn't worth the cost regardless of measured latency):
+recommendation is held to, on top of `default_interval`/`default_timeout`. When
+multiple matching rules set a floor, the highest wins. The floor applies to the
+*recommendation itself*, not to "whatever's currently in NetBox" — so a rule can
+force a slow/rarely-changing device to a longer interval even if it happens to
+answer probes quickly (e.g. a remote site over a WAN link where fast polling
+isn't worth the cost regardless of measured latency), while still letting the
+value come back down to that floor later if something earlier had pushed it
+higher:
 
 ```yaml
 rules:

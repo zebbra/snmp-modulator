@@ -82,13 +82,19 @@ def _recommend_polling(probed_durations: list, interval_steps: list, timeout_ste
 
     Total probe duration is rounded up to the nearest NetBox choice-set step,
     then raised to at least the resolved floor (global default or a rule's
-    interval/timeout override, whichever is higher).
+    interval/timeout override, whichever is higher) — this floor is the only
+    lower bound; a device's *current* NetBox value plays no part in it. That's
+    deliberate: the floor is "the slowest cadence the mapping ever intends for
+    this device," not "whatever a single unlucky slow probe happened to push
+    it to previously." A device that once had a bad probe pushing it up to 1h
+    recovers back down to its real floor once probes are fast again, instead
+    of being stuck there forever (which the old "only ever raise, compared
+    against whatever's currently in NetBox" behavior did).
 
     Returns (new_interval, new_timeout, resolved_interval, resolved_timeout):
-    new_* is only non-None when it exceeds the device's current value (so an
-    existing setting never regresses) — that's what gets written to NetBox.
-    resolved_* is always set to whatever is in effect after this run (the new
-    value if one was written, otherwise the current one) — useful for callers
+    new_* is only non-None when it differs from the device's current value
+    (either direction) — that's what gets written to NetBox. resolved_* is
+    always this run's recommendation, changed or not — useful for callers
     that want to report the effective interval/timeout regardless of whether
     anything actually changed.
     """
@@ -98,18 +104,22 @@ def _recommend_polling(probed_durations: list, interval_steps: list, timeout_ste
     rec_interval_s = max(_round_up_to_step(rec_timeout_s * 2, interval_steps),
                          _round_up_to_step(interval_floor_s, interval_steps))
 
-    resolved_timeout_s  = max(rec_timeout_s, cur_timeout_s)
-    resolved_interval_s = max(rec_interval_s, cur_interval_s)
+    new_timeout  = _format_duration(rec_timeout_s)  if rec_timeout_s  != cur_timeout_s  else None
+    new_interval = _format_duration(rec_interval_s) if rec_interval_s != cur_interval_s else None
 
-    new_timeout  = _format_duration(resolved_timeout_s)  if resolved_timeout_s  > cur_timeout_s  else None
-    new_interval = _format_duration(resolved_interval_s) if resolved_interval_s > cur_interval_s else None
-
+    if new_timeout or new_interval:
+        cur_timeout_fmt  = _format_duration(cur_timeout_s)
+        cur_interval_fmt = _format_duration(cur_interval_s)
+        timeout_part  = f"timeout: {cur_timeout_fmt}→{new_timeout}" if new_timeout else "timeout: ok"
+        interval_part = f"interval: {cur_interval_fmt}→{new_interval}" if new_interval else "interval: ok"
+        suffix = f"  {timeout_part}  {interval_part}"
+    else:
+        suffix = "  ok"
     log.info(
         "Polling(%s): total_probe=%.1fs  rec_timeout=%s  rec_interval=%s%s",
-        label, total_s, _format_duration(rec_timeout_s), _format_duration(rec_interval_s),
-        f"  timeout→{new_timeout}  interval→{new_interval}" if (new_timeout or new_interval) else "  ok",
+        label, total_s, _format_duration(rec_timeout_s), _format_duration(rec_interval_s), suffix,
     )
-    return new_interval, new_timeout, _format_duration(resolved_interval_s), _format_duration(resolved_timeout_s)
+    return new_interval, new_timeout, _format_duration(rec_interval_s), _format_duration(rec_timeout_s)
 
 
 def _drop_unknown_modules(unconditional: set, test: set, known_modules, label: str) -> tuple:
