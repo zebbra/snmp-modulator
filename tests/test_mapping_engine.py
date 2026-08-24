@@ -515,6 +515,20 @@ def test_format_duration_prefers_minutes_when_exact() -> None:
     assert _format_duration(90) == "90s"
 
 
+def test_format_duration_prefers_hours_over_minutes_when_exact() -> None:
+    # Regression: 3600 % 60 == 0 too, so without checking hours first this
+    # formatted as "60m" — not a valid NetBox choice (only "1h"/"2h" are),
+    # so the write was rejected outright ("Invalid choice (60m)").
+    assert _format_duration(3600) == "1h"
+    assert _format_duration(7200) == "2h"
+    assert _format_duration(1800) == "30m"   # not an exact hour — stays in minutes
+
+
+def test_format_duration_round_trips_through_parse_duration() -> None:
+    for value in ["30s", "90s", "2m", "30m", "1h", "2h"]:
+        assert _format_duration(_parse_duration(value)) == value
+
+
 def test_round_up_to_step_rounds_up_past_a_boundary() -> None:
     # Regression: previously int()-truncated the input before comparing to
     # steps, so 30.6 rounded DOWN to 30 instead of up to 60.

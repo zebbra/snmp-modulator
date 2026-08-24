@@ -47,7 +47,14 @@ def _parse_duration(s: str) -> int:
 
 
 def _format_duration(seconds: int) -> str:
-    """Format seconds to a duration string (e.g. 120 → '2m', 90 → '90s')."""
+    """Format seconds to a duration string (e.g. 120 → '2m', 90 → '90s', 3600 → '1h').
+
+    Hour-scale values must be checked first — 3600 % 60 == 0 too, so without
+    this ordering an exact hour would format as "60m" instead of "1h" and get
+    rejected by NetBox (whose choice sets offer "1h"/"2h", not "60m"/"120m").
+    """
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
     if seconds % 60 == 0:
         return f"{seconds // 60}m"
     return f"{seconds}s"
