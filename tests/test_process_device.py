@@ -847,5 +847,112 @@ def test_normal_and_fast_polling_both_written_when_modules_change(tmp_path) -> N
     assert nb.fast_polling_updates == [(1, "5m", result.polling_timeout_fast)]
 
 
+# ── pin_tag: skip a device entirely on batch runs, never on an explicit host ────
+
+MAPPING_PIN_TAG = """
+pin_tag: pin-snmp
+auth:
+  policy: use
+modules:
+  policy: drop
+defaults:
+  modules:
+    try: [if_mib]
+"""
+
+
+def _tagged_device(*slugs, **kw) -> DeviceInfo:
+    tags = [SimpleNamespace(slug=s) for s in slugs]
+    return _device(nb_device=SimpleNamespace(tags=tags), snmp_auth_profile="public_v2", **kw)
+
+
+def test_pinned_device_skipped_on_batch_run(tmp_path) -> None:
+    engine = _engine(tmp_path, MAPPING_PIN_TAG)
+    nb = FakeNetboxClient()
+    snmp = FakeSnmpExporterClient(
+        modules=["if_mib"], auths=[],
+        probe_results={"if_mib": ModuleTestResult(module="if_mib", useful=True, metric_count=5, duration_seconds=0.2)},
+    )
+    mod = Modulator(nb, snmp, engine, module_policy="drop", honor_pins=True)
+    dev = _tagged_device("pin-snmp", current_modules=["if_mib"])
+    result = mod.process_device(dev)
+
+    assert result.skipped == "pinned"
+    assert result.error is None
+    assert result.changed is False
+    assert result.final_modules == ["if_mib"]   # untouched, not wiped
+    assert nb.module_updates == []
+    assert nb.auth_updates == []
+
+
+def test_explicit_single_host_ignores_pin_tag(tmp_path) -> None:
+    engine = _engine(tmp_path, MAPPING_PIN_TAG)
+    nb = FakeNetboxClient()
+    snmp = FakeSnmpExporterClient(
+        modules=["if_mib"], auths=[],
+        probe_results={"if_mib": ModuleTestResult(module="if_mib", useful=True, metric_count=5, duration_seconds=0.2)},
+    )
+    mod = Modulator(nb, snmp, engine, module_policy="drop", honor_pins=False)
+    dev = _tagged_device("pin-snmp")
+    result = mod.process_device(dev)
+
+    assert result.skipped is None
+    assert result.final_modules == ["if_mib"]
+    assert nb.module_updates == [(1, ["if_mib"], [], [])]
+
+
+def test_untagged_device_processed_normally_even_with_pin_tag_configured(tmp_path) -> None:
+    engine = _engine(tmp_path, MAPPING_PIN_TAG)
+    nb = FakeNetboxClient()
+    snmp = FakeSnmpExporterClient(
+        modules=["if_mib"], auths=[],
+        probe_results={"if_mib": ModuleTestResult(module="if_mib", useful=True, metric_count=5, duration_seconds=0.2)},
+    )
+    mod = Modulator(nb, snmp, engine, module_policy="drop", honor_pins=True)
+    dev = _tagged_device("some-other-tag")
+    result = mod.process_device(dev)
+
+    assert result.skipped is None
+    assert nb.module_updates == [(1, ["if_mib"], [], [])]
+
+
+def test_pin_tag_disabled_by_default(tmp_path) -> None:
+    # No pin_tag configured in mapping.yaml — even a device tagged "pin-snmp"
+    # (a bare coincidence, or the tag exists in NetBox but this deployment
+    # hasn't opted in) is processed normally.
+    engine = _engine(tmp_path, """
+auth:
+  policy: use
+modules:
+  policy: drop
+defaults:
+  modules:
+    try: [if_mib]
+""")
+    nb = FakeNetboxClient()
+    snmp = FakeSnmpExporterClient(
+        modules=["if_mib"], auths=[],
+        probe_results={"if_mib": ModuleTestResult(module="if_mib", useful=True, metric_count=5, duration_seconds=0.2)},
+    )
+    mod = Modulator(nb, snmp, engine, module_policy="drop", honor_pins=True)
+    dev = _tagged_device("pin-snmp")
+    result = mod.process_device(dev)
+
+    assert result.skipped is None
+    assert nb.module_updates == [(1, ["if_mib"], [], [])]
+
+
+def test_commit_is_a_noop_on_a_pinned_result(tmp_path) -> None:
+    mod, nb = _commit_modulator(tmp_path)
+    result = ModulationResult(
+        device_id=7, device_name="sw1",
+        previous_modules=["if_mib"], final_modules=["if_mib"],
+        changed=False, test_results=[], skipped="pinned",
+    )
+    mod.commit(result)
+
+    assert nb.module_updates == [] and nb.tag_updates == [] and nb.touch_calls == []
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

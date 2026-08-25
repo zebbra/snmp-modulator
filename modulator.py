@@ -209,6 +209,7 @@ class ModulationResult:
     pending_add_tags:    list = field(default_factory=list)   # on_success/on_fail tags — applied by commit()
     pending_remove_tags: list = field(default_factory=list)
     unreachable: bool = False                # all probes returned useless; existing module list preserved
+    skipped: Optional[str] = None            # reason the device was skipped entirely, e.g. "pinned" (not an error)
     error: Optional[str] = None
 
 
@@ -756,6 +757,13 @@ class MappingEngine:
         # auth, tag, or polling field write) — never touched if nothing changed.
         # Omit or set empty to disable.
         self.touch_field:      Optional[str] = raw.get("touch_field", "snmp_modulator_last_updated") or None
+        # A device tagged with this NetBox tag slug is skipped entirely — auth,
+        # modules, and polling all left untouched — on batch runs (Modulator
+        # constructed with honor_pins=True, the default). An explicit single-host
+        # request (honor_pins=False) always processes the device regardless, on
+        # the assumption that deliberately naming a host is itself informed
+        # consent to change it. Omit/empty to disable the feature outright.
+        self.pin_tag:          Optional[str] = raw.get("pin_tag") or None
         self.default_interval: int = _parse_duration(modules_cfg.get("default_interval", "3m"))
         self.default_timeout:  int = _parse_duration(modules_cfg.get("default_timeout",  "2m"))
 
@@ -854,6 +862,7 @@ class MappingEngine:
             "interval_field":  self.interval_field,
             "timeout_field":   self.timeout_field,
             "touch_field":     self.touch_field,
+            "pin_tag":         self.pin_tag,
             "default_interval": _format_duration(self.default_interval),
             "default_timeout":  _format_duration(self.default_timeout),
             "fast_module_field":     self.fast_module_field,
@@ -1183,6 +1192,7 @@ class Modulator:
         dry_run: bool = False,
         module_policy: str = "drop",
         device_parallelism: int = 1,
+        honor_pins: bool = True,
     ):
         """
         module_policy controls how modules already in snmp_exporter_module are handled:
@@ -1193,6 +1203,12 @@ class Modulator:
 
         device_parallelism: number of devices probed concurrently within one run
         (1 = sequential). SNMP probing is I/O-bound, so threads scale well.
+
+        honor_pins: when True (the default — meant for batch/scheduled runs), a
+        device tagged with engine.pin_tag is skipped entirely, untouched. Pass
+        False for an explicit single-host request (e.g. /probe?host=X, cli.py
+        --host) — deliberately naming a host is itself informed consent to
+        change it, so the pin doesn't apply there.
         """
         if module_policy not in MODULE_POLICIES:
             raise ValueError(f"module_policy must be one of {MODULE_POLICIES}, got {module_policy!r}")
@@ -1204,6 +1220,7 @@ class Modulator:
         self.dry_run     = dry_run
         self.module_policy = module_policy
         self.device_parallelism = device_parallelism
+        self.honor_pins  = honor_pins
 
         # Polling step ladders are sourced from the NetBox selection custom fields.
         # When either choice set is unavailable, polling calculation is disabled.
@@ -1273,9 +1290,10 @@ class Modulator:
         re-probing (e.g. server.py: preview with dry_run=true, then confirm
         with a plain, non-dry-run call for the same query shortly after).
 
-        No-op on an errored result — nothing meaningful was resolved.
+        No-op on an errored or skipped result — nothing meaningful was
+        resolved (or the device was deliberately left untouched, e.g. pinned).
         """
-        if result.error:
+        if result.error or result.skipped:
             return
         log = log or logging.getLogger(f"{APP_NAME}.{result.device_name}")
 
@@ -1359,7 +1377,9 @@ class Modulator:
 
         def _one(device: DeviceInfo) -> ModulationResult:
             result = self.process_device(device, callbacks, on_module_result=on_module_result)
-            if result.error:
+            if result.skipped:
+                outcome = result.skipped
+            elif result.error:
                 outcome = "error"
             elif result.unreachable:
                 outcome = "unreachable"
@@ -1378,13 +1398,14 @@ class Modulator:
             ) as ex:
                 results = list(ex.map(_one, devices))
 
-        ok    = sum(1 for r in results if not r.error and not r.unreachable)
+        skip  = sum(1 for r in results if r.skipped)
+        ok    = sum(1 for r in results if not r.error and not r.unreachable and not r.skipped)
         err   = sum(1 for r in results if r.error)
         unrch = sum(1 for r in results if r.unreachable)
         chg   = sum(1 for r in results if r.changed)
         logger.info(
-            "Run complete: %d device(s)  ok=%d err=%d unreachable=%d changed=%d",
-            len(results), ok, err, unrch, chg,
+            "Run complete: %d device(s)  ok=%d err=%d unreachable=%d skipped=%d changed=%d",
+            len(results), ok, err, unrch, skip, chg,
         )
         return results
 
@@ -1398,6 +1419,28 @@ class Modulator:
             callbacks = Callbacks()
 
         log = logging.getLogger(f"{APP_NAME}.{device.primary_ip}")
+
+        if self.honor_pins and self.engine.pin_tag:
+            raw_tags = _get_field(device.nb_device, "tags") or []
+            tag_slugs = {getattr(t, "slug", None) or str(t) for t in raw_tags}
+            if self.engine.pin_tag in tag_slugs:
+                log.info(
+                    "Device tagged %r — pinned by a human, skipping untouched (batch run)",
+                    self.engine.pin_tag,
+                )
+                previous_modules = sorted(device.current_modules)
+                previous_modules_fast = sorted(device.current_modules_fast)
+                return ModulationResult(
+                    device_id=device.id,
+                    device_name=device.name,
+                    previous_modules=previous_modules,
+                    final_modules=previous_modules,
+                    changed=False,
+                    test_results=[],
+                    previous_modules_fast=previous_modules_fast,
+                    final_modules_fast=previous_modules_fast,
+                    skipped="pinned",
+                )
 
         active_snmp = self.snmp
         log.info("── device %s  name=%r  auth=%r",

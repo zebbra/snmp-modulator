@@ -136,6 +136,7 @@ def main(host, netbox_filter, mapping, module_policy, auth_policy, module_field,
         dry_run=dry_run,
         module_policy=resolved_module_policy,
         device_parallelism=device_parallelism,
+        honor_pins=not bool(host),   # explicit --host is deliberate — ignore any pin tag
     )
 
     if dry_run:

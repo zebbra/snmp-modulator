@@ -185,6 +185,29 @@ def test_run_probe_forwards_dry_run_override_to_modulator(monkeypatch) -> None:
     assert seen_kwargs["dry_run"] is True  # overrides server-wide _DRY_RUN=False for this call only
 
 
+def test_run_probe_forwards_honor_pins_to_modulator(monkeypatch) -> None:
+    monkeypatch.setattr(
+        server, "_make_clients",
+        lambda: (SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), "drop"),
+    )
+    seen_kwargs = {}
+
+    class FakeModulator:
+        def __init__(self, *a, **kw):
+            seen_kwargs.update(kw)
+
+        def run(self, devices, callbacks=None, on_module_result=None):
+            return []
+
+    monkeypatch.setattr(server, "Modulator", FakeModulator)
+
+    server._run_probe("host:10.0.0.5", lambda nb: [], honor_pins=False)
+    assert seen_kwargs["honor_pins"] is False
+
+    server._run_probe("host:10.0.0.6", lambda nb: [])
+    assert seen_kwargs["honor_pins"] is True  # default — batch/unspecified callers respect the pin
+
+
 def test_run_probe_returns_none_when_no_slot_frees_up_in_time() -> None:
     assert server._probe_semaphore.acquire(blocking=False)  # occupy the only slot
     try:

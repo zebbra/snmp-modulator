@@ -78,6 +78,7 @@ All probe behaviour is controlled by `mapping.yaml`.
 
 ```yaml
 touch_field: snmp_modulator_last_updated  # date field set on any real change; omit/empty to disable
+pin_tag: pin-snmp   # device tagged with this NetBox tag slug is skipped entirely on batch runs; omit/empty to disable
 
 modules:
   field:  snmp_exporter_module  # NetBox multi-select custom field
@@ -114,6 +115,24 @@ auth:
 | `drop` | Ignore NetBox value; discover working profile from rule candidates only |
 
 Rule-level `auth.try` is always probed in the order written — the rule author's preference (e.g. v3 before v2) is honored. With global `policy=try`, the device's current NetBox profile is appended to the end of the candidate list as a final fallback (deduped if already present).
+
+### Pinning a device
+
+`pin_tag` names a NetBox tag slug (e.g. `pin-snmp`) that means "a human has set
+this device's auth/modules/polling deliberately — don't overwrite it." A
+tagged device is skipped entirely (auth, modules, polling all left exactly as
+they are) — but **only on batch runs**: `/probe/netbox`, `cli.py
+--netbox-filter`, or anything scheduled. An *explicit* single-host request
+(`/probe?host=X`, `cli.py --host`) always processes the device regardless of
+the tag — naming a specific host is itself a deliberate decision to change it,
+so the pin doesn't apply there. This can't be expressed as a normal mapping.yaml
+rule (rules only ever see device attributes, never *how* the run was
+triggered) — it's controlled by the `Modulator(honor_pins=...)` constructor
+argument, which server.py/cli.py set based on the request type.
+
+A pinned device is reported as `skipped: "pinned"` (not `error`) on its
+`ModulationResult`, and as `result="pinned"` on `modulator_devices_processed_total`
+— it's a deliberate no-op, not a failure.
 
 ### defaults
 

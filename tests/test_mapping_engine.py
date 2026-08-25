@@ -62,6 +62,18 @@ def test_touch_field_disabled_when_set_empty(tmp_path) -> None:
     assert engine.touch_field is None
 
 
+# ── pin_tag: disabled by default, configurable ──────────────────────────────────
+
+def test_pin_tag_disabled_when_omitted(tmp_path) -> None:
+    engine = _engine(tmp_path, "modules:\n  policy: drop\n")
+    assert engine.pin_tag is None
+
+
+def test_pin_tag_honors_explicit_value(tmp_path) -> None:
+    engine = _engine(tmp_path, "pin_tag: pin-snmp\nmodules:\n  policy: drop\n")
+    assert engine.pin_tag == "pin-snmp"
+
+
 # ── evaluate(): defaults + rule accumulation ───────────────────────────────────
 
 MAPPING_ROLE_RULES = """

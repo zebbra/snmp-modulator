@@ -533,6 +533,7 @@ def _run_probe(
     dry_run: Optional[bool] = None,
     acquire_timeout: Optional[float] = None,
     reraise: bool = False,
+    honor_pins: bool = True,
 ) -> Optional[list]:
     """Execute a probe job. Returns list[ModulationResult], or None if no probe
     slot freed up within acquire_timeout seconds. Background jobs pass
@@ -544,6 +545,10 @@ def _run_probe(
     unreachable, etc.): background jobs swallow and log it (False, default);
     wait=true passes True so the caller gets a real error instead of it being
     indistinguishable from "no matching device".
+
+    honor_pins is forwarded to Modulator — /probe?host=X passes False (an
+    explicit single host is deliberate, pin or not); /probe/netbox leaves the
+    default True (a filter sweep should respect a device tagged pinned).
 
     A non-dry-run call for a job_key with a still-fresh cached dry-run result
     (see _dry_run_cache above) skips probing entirely and just commits that
@@ -580,6 +585,7 @@ def _run_probe(
                     dry_run=resolved_dry_run,
                     module_policy=module_policy,
                     device_parallelism=_DEVICE_PARALLELISM,
+                    honor_pins=honor_pins,
                 )
                 devices = devices_fn(nb)
                 results = mod.run(
@@ -662,7 +668,9 @@ async def probe_host(
 
     if wait:
         try:
-            results = await asyncio.to_thread(_run_probe, job_key, fetch, dry_run, _WAIT_TIMEOUT, True)
+            results = await asyncio.to_thread(
+                _run_probe, job_key, fetch, dry_run, _WAIT_TIMEOUT, True, honor_pins=False,
+            )
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"probe failed: {exc}") from exc
         if results is None:
@@ -682,7 +690,7 @@ async def probe_host(
             "result": asdict(results[0]),
         }
 
-    background_tasks.add_task(_run_probe, job_key, fetch, dry_run)
+    background_tasks.add_task(_run_probe, job_key, fetch, dry_run, honor_pins=False)
     logger.info("Probe queued for host %r", host)
     return JSONResponse(status_code=202, content={"status": "queued", "host": host})
 
