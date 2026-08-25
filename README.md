@@ -489,14 +489,17 @@ modulator_netbox_updates_total{action="changed|unchanged"}
 modulator_module_changes_total{module="<name>", action="added|removed"}
 modulator_auth_probe_results_total{result="resolved|failed|skipped"}
 modulator_probe_duration_seconds
-modulator_probe_in_progress
-modulator_probe_jobs_in_flight
+modulator_probe_running
+modulator_probe_queued
+modulator_probe_queue_depth
 modulator_netbox_devices_by_auth{profile="<name>"}
 modulator_netbox_devices_by_module{module="<name>"}
 modulator_netbox_devices_refresh_duration_seconds
 ```
 
 `modulator_netbox_devices_by_auth` and `modulator_netbox_devices_by_module` are seeded from snmp-exporter `/config`, so every known profile/module appears — including with value `0` when no device uses it. That makes "find unused" a one-liner: `modulator_netbox_devices_by_auth == 0`. Refresh cadence is controlled by `MODULATOR_NETBOX_REFRESH_INTERVAL` (one cheap pagination-count query per known value, no full device fetch).
+
+`modulator_probe_running` is jobs actively executing (semaphore slot held, bounded by `MODULATOR_MAX_CONCURRENT_RUNS`); `modulator_probe_queued` is every accepted-but-unfinished job (running + waiting); `modulator_probe_queue_depth` is waiting-for-a-slot only. So `queued - running == queue_depth` always holds, but `queue_depth` is there directly so you don't need the subtraction for an alert rule.
 
 ---
 

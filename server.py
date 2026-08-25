@@ -173,15 +173,21 @@ probe_duration = Histogram(
     buckets=[5, 30, 60, 120, 300, 600, 1800],
     **_reg,
 )
-probe_in_progress = Gauge(
-    "modulator_probe_in_progress",
-    "Number of probe jobs currently executing",
+probe_running = Gauge(
+    "modulator_probe_running",
+    "Probe jobs actively executing (semaphore slot acquired)",
     multiprocess_mode="livesum",
     **_reg,
 )
-probe_jobs_in_flight = Gauge(
-    "modulator_probe_jobs_in_flight",
-    "Probe jobs accepted but not yet finished (running + queued); queue depth = this minus modulator_probe_in_progress",
+probe_queued = Gauge(
+    "modulator_probe_queued",
+    "Probe jobs accepted but not yet finished (running + waiting for a slot)",
+    multiprocess_mode="livesum",
+    **_reg,
+)
+probe_queue_depth = Gauge(
+    "modulator_probe_queue_depth",
+    "Probe jobs waiting for a free slot (excludes ones already running)",
     multiprocess_mode="livesum",
     **_reg,
 )
@@ -556,10 +562,15 @@ def _run_probe(
                 )
                 return _commit_cached_results(cached)
 
-        if not _probe_semaphore.acquire(timeout=acquire_timeout):
+        probe_queue_depth.inc()
+        try:
+            acquired = _probe_semaphore.acquire(timeout=acquire_timeout)
+        finally:
+            probe_queue_depth.dec()
+        if not acquired:
             return None
         try:
-            probe_in_progress.inc()
+            probe_running.inc()
             with _probe_progress_lock:
                 _probe_progress[job_key] = []
             try:
@@ -584,7 +595,7 @@ def _run_probe(
                     raise
                 results = []
             finally:
-                probe_in_progress.dec()
+                probe_running.dec()
                 probe_duration.observe(time.time() - start)
         finally:
             _probe_semaphore.release()
@@ -593,7 +604,7 @@ def _run_probe(
             _in_flight.discard(job_key)
         with _probe_progress_lock:
             _probe_progress.pop(job_key, None)
-        probe_jobs_in_flight.dec()
+        probe_queued.dec()
         logger.info("Probe job %r finished in %.1fs", job_key, time.time() - start)
     return results
 
@@ -640,7 +651,7 @@ async def probe_host(
                 content={"status": "skipped", "host": host, "reason": "already in progress"},
             )
         _in_flight.add(job_key)
-    probe_jobs_in_flight.inc()
+    probe_queued.inc()
 
     def fetch(nb: NetboxClient):
         device = nb.get_device_by_host(host)
@@ -780,7 +791,7 @@ async def probe_netbox(
         if job_key in _in_flight:
             return {"status": "skipped", "filter": filter_params, "reason": "already in progress"}
         _in_flight.add(job_key)
-    probe_jobs_in_flight.inc()
+    probe_queued.inc()
 
     def fetch(nb: NetboxClient):
         return nb.get_devices(**filter_params)
@@ -973,8 +984,9 @@ async def index() -> str:
 <style>{_DASHBOARD_CSS}</style></head><body>
 <h1>snmp-modulator <small style="color:#888;font-size:.5em">v{__version__}</small></h1>
 <p>Mode: {mode_badge}
-&nbsp; Probes in progress: <b>{int(_metric_value("modulator_probe_in_progress"))}</b>
-&nbsp; Jobs in flight: <b>{int(_metric_value("modulator_probe_jobs_in_flight"))}</b>
+&nbsp; Running: <b>{int(_metric_value("modulator_probe_running"))}</b>
+&nbsp; Queued: <b>{int(_metric_value("modulator_probe_queued"))}</b>
+&nbsp; Waiting for a slot: <b>{int(_metric_value("modulator_probe_queue_depth"))}</b>
 &nbsp; Max concurrent: <b>{_MAX_CONCURRENT}</b> per worker
 (<b>{_MAX_CONCURRENT * _WORKERS}</b> pod-wide across {_WORKERS} workers)
 &nbsp; Device parallelism: <b>{_DEVICE_PARALLELISM}</b>
@@ -1049,7 +1061,7 @@ async def health() -> dict:
     return {
         "status": "ok",
         "version": __version__,
-        "probe_in_progress": len(_in_flight),
+        "probe_queued": len(_in_flight),
         "in_flight": list(_in_flight),
         "netbox_only_module_count":        len(mismatch["netbox_only"]),
         "snmp_exporter_only_module_count": len(mismatch["snmp_exporter_only"]),

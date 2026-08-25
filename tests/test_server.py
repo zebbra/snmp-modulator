@@ -154,9 +154,9 @@ def test_run_probe_releases_semaphore_and_clears_in_flight(monkeypatch) -> None:
     monkeypatch.setattr(server, "Modulator", FakeModulator)
 
     server._in_flight.add("host:10.0.0.1")
-    before = server.probe_in_progress._value.get()
+    before = server.probe_running._value.get()
     server._run_probe("host:10.0.0.1", lambda nb: ["dev1"])
-    after = server.probe_in_progress._value.get()
+    after = server.probe_running._value.get()
 
     assert before == after  # incremented then decremented back to baseline
     assert ran == [["dev1"]]
@@ -189,13 +189,16 @@ def test_run_probe_returns_none_when_no_slot_frees_up_in_time() -> None:
     assert server._probe_semaphore.acquire(blocking=False)  # occupy the only slot
     try:
         server._in_flight.add("host:busy")
-        server.probe_jobs_in_flight.inc()
+        server.probe_queued.inc()
+        before = server.probe_queue_depth._value.get()
         result = server._run_probe("host:busy", lambda nb: ["dev1"], acquire_timeout=0.05)
+        after = server.probe_queue_depth._value.get()
     finally:
         server._probe_semaphore.release()
 
     assert result is None
     assert "host:busy" not in server._in_flight  # bookkeeping still cleared on timeout
+    assert before == after  # queue_depth incremented while waiting, decremented after the timeout
 
 
 def test_run_probe_swallows_infra_failure_by_default(monkeypatch) -> None:
@@ -409,11 +412,11 @@ def test_metric_samples_reads_labeled_gauge_values() -> None:
 
 
 def test_metric_value_reads_unlabeled_gauge() -> None:
-    server.probe_in_progress.inc()
+    server.probe_running.inc()
     try:
-        assert server._metric_value("modulator_probe_in_progress") >= 1
+        assert server._metric_value("modulator_probe_running") >= 1
     finally:
-        server.probe_in_progress.dec()
+        server.probe_running.dec()
 
 
 # ── / dashboard ──────────────────────────────────────────────────────────────────
