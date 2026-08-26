@@ -954,5 +954,103 @@ def test_commit_is_a_noop_on_a_pinned_result(tmp_path) -> None:
     assert nb.module_updates == [] and nb.tag_updates == [] and nb.touch_calls == []
 
 
+# ── liveness: skip a device batch-run-only when reported down ──────────────────
+
+MAPPING_LIVENESS = """
+auth:
+  policy: use
+modules:
+  policy: drop
+defaults:
+  modules:
+    try: [if_mib]
+"""
+
+
+def test_device_reported_down_by_liveness_is_skipped_on_batch_run(tmp_path) -> None:
+    engine = _engine(tmp_path, MAPPING_LIVENESS)
+    nb = FakeNetboxClient()
+    snmp = FakeSnmpExporterClient(
+        modules=["if_mib"], auths=[],
+        probe_results={"if_mib": ModuleTestResult(module="if_mib", useful=True, metric_count=5, duration_seconds=0.2)},
+    )
+    mod = Modulator(
+        nb, snmp, engine, module_policy="drop",
+        honor_pins=True, liveness={"sw1": False}, liveness_key="name",
+    )
+    dev = _device(current_modules=["if_mib"], snmp_auth_profile="public_v2", name="sw1")
+    result = mod.process_device(dev)
+
+    assert result.skipped == "offline"
+    assert result.error is None
+    assert result.final_modules == ["if_mib"]   # untouched
+    assert nb.module_updates == []
+
+
+def test_device_missing_from_liveness_map_fails_open(tmp_path) -> None:
+    engine = _engine(tmp_path, MAPPING_LIVENESS)
+    nb = FakeNetboxClient()
+    snmp = FakeSnmpExporterClient(
+        modules=["if_mib"], auths=[],
+        probe_results={"if_mib": ModuleTestResult(module="if_mib", useful=True, metric_count=5, duration_seconds=0.2)},
+    )
+    mod = Modulator(
+        nb, snmp, engine, module_policy="drop",
+        honor_pins=True, liveness={"some-other-device": False}, liveness_key="name",
+    )
+    dev = _device(snmp_auth_profile="public_v2", name="sw1")   # not in the liveness map at all
+    result = mod.process_device(dev)
+
+    assert result.skipped is None
+    assert nb.module_updates == [(1, ["if_mib"], [], [])]
+
+
+def test_explicit_single_host_ignores_liveness(tmp_path) -> None:
+    engine = _engine(tmp_path, MAPPING_LIVENESS)
+    nb = FakeNetboxClient()
+    snmp = FakeSnmpExporterClient(
+        modules=["if_mib"], auths=[],
+        probe_results={"if_mib": ModuleTestResult(module="if_mib", useful=True, metric_count=5, duration_seconds=0.2)},
+    )
+    mod = Modulator(
+        nb, snmp, engine, module_policy="drop",
+        honor_pins=False, liveness={"sw1": False}, liveness_key="name",
+    )
+    dev = _device(snmp_auth_profile="public_v2", name="sw1")
+    result = mod.process_device(dev)
+
+    assert result.skipped is None
+    assert nb.module_updates == [(1, ["if_mib"], [], [])]
+
+
+def test_liveness_keyed_by_ip_when_configured(tmp_path) -> None:
+    engine = _engine(tmp_path, MAPPING_LIVENESS)
+    nb = FakeNetboxClient()
+    snmp = FakeSnmpExporterClient(modules=["if_mib"], auths=[])
+    mod = Modulator(
+        nb, snmp, engine, module_policy="drop",
+        honor_pins=True, liveness={"10.0.0.1": False}, liveness_key="ip",
+    )
+    dev = _device(snmp_auth_profile="public_v2", primary_ip="10.0.0.1")
+    result = mod.process_device(dev)
+
+    assert result.skipped == "offline"
+
+
+def test_liveness_none_disables_the_check(tmp_path) -> None:
+    engine = _engine(tmp_path, MAPPING_LIVENESS)
+    nb = FakeNetboxClient()
+    snmp = FakeSnmpExporterClient(
+        modules=["if_mib"], auths=[],
+        probe_results={"if_mib": ModuleTestResult(module="if_mib", useful=True, metric_count=5, duration_seconds=0.2)},
+    )
+    mod = Modulator(nb, snmp, engine, module_policy="drop", honor_pins=True, liveness=None)
+    dev = _device(snmp_auth_profile="public_v2", name="sw1")
+    result = mod.process_device(dev)
+
+    assert result.skipped is None
+    assert nb.module_updates == [(1, ["if_mib"], [], [])]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

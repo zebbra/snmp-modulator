@@ -23,7 +23,15 @@ import urllib.parse
 
 import click
 
-from modulator import AUTH_POLICIES, MODULE_POLICIES, MappingEngine, Modulator, NetboxClient, SnmpExporterClient
+from modulator import (
+    AUTH_POLICIES,
+    MODULE_POLICIES,
+    MappingEngine,
+    Modulator,
+    NetboxClient,
+    SnmpExporterClient,
+    fetch_liveness,
+)
 
 
 @click.command()
@@ -131,12 +139,28 @@ def main(host, netbox_filter, mapping, module_policy, auth_policy, module_field,
         verify_tls=verify_tls,
         timeout=timeout,
     )
+    is_batch = not bool(host)   # explicit --host is deliberate — ignore any pin tag/liveness
+    liveness = None
+    liveness_url = os.getenv("MODULATOR_LIVENESS_URL")
+    if is_batch and liveness_url:
+        try:
+            liveness = fetch_liveness(
+                liveness_url,
+                os.getenv("MODULATOR_LIVENESS_QUERY", 'probe_success{job="network-netbox-ping"}'),
+                label=os.getenv("MODULATOR_LIVENESS_LABEL", "instance"),
+                timeout=int(os.getenv("MODULATOR_LIVENESS_TIMEOUT", "15")),
+                verify_tls=os.getenv("MODULATOR_LIVENESS_TLS_VERIFY", "true").lower() != "false",
+            )
+        except Exception as exc:
+            log.warning("Liveness query failed — proceeding without filtering: %s", exc)
     mod = Modulator(
         nb, snmp, engine,
         dry_run=dry_run,
         module_policy=resolved_module_policy,
         device_parallelism=device_parallelism,
-        honor_pins=not bool(host),   # explicit --host is deliberate — ignore any pin tag
+        honor_pins=is_batch,
+        liveness=liveness,
+        liveness_key=os.getenv("MODULATOR_LIVENESS_KEY", "name").lower(),
     )
 
     if dry_run:

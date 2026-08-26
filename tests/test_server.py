@@ -208,6 +208,61 @@ def test_run_probe_forwards_honor_pins_to_modulator(monkeypatch) -> None:
     assert seen_kwargs["honor_pins"] is True  # default — batch/unspecified callers respect the pin
 
 
+# ── liveness gate ────────────────────────────────────────────────────────────────
+
+def test_fetch_liveness_or_none_disabled_without_url(monkeypatch) -> None:
+    monkeypatch.setattr(server, "_LIVENESS_URL", None)
+    assert server._fetch_liveness_or_none() is None
+
+
+def test_fetch_liveness_or_none_returns_map_and_sets_gauge_on_success(monkeypatch) -> None:
+    monkeypatch.setattr(server, "_LIVENESS_URL", "http://vm")
+    monkeypatch.setattr(server, "fetch_liveness", lambda *a, **kw: {"sw1": True, "sw2": False})
+
+    result = server._fetch_liveness_or_none()
+
+    assert result == {"sw1": True, "sw2": False}
+    assert server._metric_value("modulator_liveness_query_up") == 1
+
+
+def test_fetch_liveness_or_none_fails_open_and_clears_gauge_on_error(monkeypatch) -> None:
+    monkeypatch.setattr(server, "_LIVENESS_URL", "http://vm")
+
+    def boom(*a, **kw):
+        raise RuntimeError("vmselect unreachable")
+
+    monkeypatch.setattr(server, "fetch_liveness", boom)
+
+    result = server._fetch_liveness_or_none()
+
+    assert result is None
+    assert server._metric_value("modulator_liveness_query_up") == 0
+
+
+def test_run_probe_only_queries_liveness_for_batch_runs(monkeypatch) -> None:
+    monkeypatch.setattr(
+        server, "_make_clients",
+        lambda: (SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), "drop"),
+    )
+    calls = []
+    monkeypatch.setattr(server, "_fetch_liveness_or_none", lambda: calls.append(1) or {"sw1": False})
+
+    class FakeModulator:
+        def __init__(self, *a, **kw):
+            pass
+
+        def run(self, devices, callbacks=None, on_module_result=None):
+            return []
+
+    monkeypatch.setattr(server, "Modulator", FakeModulator)
+
+    server._run_probe("host:10.0.0.7", lambda nb: [], honor_pins=False)
+    assert calls == []   # explicit single host — never queried
+
+    server._run_probe("netbox:role=switch", lambda nb: [])
+    assert calls == [1]   # batch — queried once
+
+
 def test_run_probe_returns_none_when_no_slot_frees_up_in_time() -> None:
     assert server._probe_semaphore.acquire(blocking=False)  # occupy the only slot
     try:

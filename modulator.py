@@ -157,6 +157,51 @@ def compare_module_sets(nb_valid_modules: Optional[frozenset], snmp_modules: set
     return sorted(nb_valid_modules - snmp_modules), sorted(snmp_modules - nb_valid_modules)
 
 
+def fetch_liveness(
+    url: str,
+    query: str,
+    label: str = "instance",
+    timeout: int = 15,
+    verify_tls: bool = True,
+) -> dict:
+    """
+    Run an instant PromQL query against a Prometheus-compatible API (e.g.
+    VictoriaMetrics vmselect) and map each series' `label` value to a
+    liveness verdict: True when the sample value is > 0.
+
+    A device with multiple series counts as up if any of them is > 0. Label
+    values carrying a CIDR suffix (relevant when label picks out an IP rather
+    than a hostname) are normalized to the bare address.
+
+    Raises on HTTP or payload errors — the caller decides fail-open behavior
+    (a query failure should mean "treat every device as unknown", never
+    "treat every device as down").
+    """
+    resp = requests.get(
+        f"{url.rstrip('/')}/api/v1/query",
+        params={"query": query},
+        timeout=timeout,
+        verify=verify_tls,
+        headers={"Accept": "application/json", "User-Agent": APP_NAME},
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    if payload.get("status") != "success":
+        raise RuntimeError(f"liveness query failed: {payload.get('error') or 'unknown error'}")
+
+    liveness: dict = {}
+    for series in payload.get("data", {}).get("result", []):
+        key = str(series.get("metric", {}).get(label) or "").split("/")[0]
+        if not key:
+            continue
+        try:
+            alive = float(series["value"][1]) > 0
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+        liveness[key] = liveness.get(key, False) or alive
+    return liveness
+
+
 # ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
@@ -1193,6 +1238,8 @@ class Modulator:
         module_policy: str = "drop",
         device_parallelism: int = 1,
         honor_pins: bool = True,
+        liveness: Optional[dict] = None,
+        liveness_key: str = "name",
     ):
         """
         module_policy controls how modules already in snmp_exporter_module are handled:
@@ -1205,15 +1252,32 @@ class Modulator:
         (1 = sequential). SNMP probing is I/O-bound, so threads scale well.
 
         honor_pins: when True (the default — meant for batch/scheduled runs), a
-        device tagged with engine.pin_tag is skipped entirely, untouched. Pass
-        False for an explicit single-host request (e.g. /probe?host=X, cli.py
-        --host) — deliberately naming a host is itself informed consent to
-        change it, so the pin doesn't apply there.
+        device tagged with engine.pin_tag is skipped entirely, untouched, and
+        liveness (below) is consulted. Pass False for an explicit single-host
+        request (e.g. /probe?host=X, cli.py --host) — deliberately naming a
+        host is itself informed consent to change/probe it, so neither the
+        pin nor a "device is down" liveness verdict applies there. Both
+        signals share the same batch-vs-explicit reasoning, hence one flag.
+
+        liveness: optional {key: bool} from fetch_liveness(), fetched once per
+        batch run (not per device) by the caller and passed in. A device whose
+        key maps to False is skipped before any SNMP probing at all — skips
+        the pointless probe against a host ICMP already reports as down (SNMP
+        itself isn't a reliable down-signal: wrong creds/module looks the
+        same as actually-down). A device missing from the dict (never
+        monitored, or the query failed) is *not* skipped — fail open, same
+        principle as honor_pins. Only consulted when honor_pins is True.
+
+        liveness_key: which DeviceInfo attribute the liveness dict is keyed
+        by — "name" (default, matches this deployment's ping job labeling by
+        device name) or "ip" (device.primary_ip).
         """
         if module_policy not in MODULE_POLICIES:
             raise ValueError(f"module_policy must be one of {MODULE_POLICIES}, got {module_policy!r}")
         if device_parallelism < 1:
             raise ValueError(f"device_parallelism must be >= 1, got {device_parallelism}")
+        if liveness_key not in ("name", "ip"):
+            raise ValueError(f"liveness_key must be 'name' or 'ip', got {liveness_key!r}")
         self.nb          = nb
         self.snmp        = snmp   # fallback / single-site client (SNMP_EXPORTER_URL)
         self.engine      = engine
@@ -1221,6 +1285,8 @@ class Modulator:
         self.module_policy = module_policy
         self.device_parallelism = device_parallelism
         self.honor_pins  = honor_pins
+        self.liveness      = liveness
+        self.liveness_key  = liveness_key
 
         # Polling step ladders are sourced from the NetBox selection custom fields.
         # When either choice set is unavailable, polling calculation is disabled.
@@ -1409,6 +1475,24 @@ class Modulator:
         )
         return results
 
+    @staticmethod
+    def _skip_result(device: DeviceInfo, reason: str) -> ModulationResult:
+        """Build a no-op ModulationResult for a device that was never
+        probed/resolved at all — pinned, or reported down by liveness."""
+        previous_modules      = sorted(device.current_modules)
+        previous_modules_fast = sorted(device.current_modules_fast)
+        return ModulationResult(
+            device_id=device.id,
+            device_name=device.name,
+            previous_modules=previous_modules,
+            final_modules=previous_modules,
+            changed=False,
+            test_results=[],
+            previous_modules_fast=previous_modules_fast,
+            final_modules_fast=previous_modules_fast,
+            skipped=reason,
+        )
+
     def process_device(
         self,
         device: DeviceInfo,
@@ -1428,19 +1512,14 @@ class Modulator:
                     "Device tagged %r — pinned by a human, skipping untouched (batch run)",
                     self.engine.pin_tag,
                 )
-                previous_modules = sorted(device.current_modules)
-                previous_modules_fast = sorted(device.current_modules_fast)
-                return ModulationResult(
-                    device_id=device.id,
-                    device_name=device.name,
-                    previous_modules=previous_modules,
-                    final_modules=previous_modules,
-                    changed=False,
-                    test_results=[],
-                    previous_modules_fast=previous_modules_fast,
-                    final_modules_fast=previous_modules_fast,
-                    skipped="pinned",
-                )
+                return self._skip_result(device, "pinned")
+
+        if self.honor_pins and self.liveness is not None:
+            key = device.name if self.liveness_key == "name" else device.primary_ip
+            alive = self.liveness.get(key)
+            if alive is False:
+                log.info("Liveness reports %r down — skipping probe (batch run)", key)
+                return self._skip_result(device, "offline")
 
         active_snmp = self.snmp
         log.info("── device %s  name=%r  auth=%r",

@@ -134,6 +134,21 @@ A pinned device is reported as `skipped: "pinned"` (not `error`) on its
 `ModulationResult`, and as `result="pinned"` on `modulator_devices_processed_total`
 — it's a deliberate no-op, not a failure.
 
+### Liveness gate
+
+`MODULATOR_LIVENESS_URL` (env var, not mapping.yaml — see [Environment
+variables](#environment-variables)) enables a pre-probe check against a
+Prometheus-compatible API: before a batch run probes a device, ask whether
+it's actually up, and skip the SNMP round-trip entirely if not. SNMP itself
+isn't a reliable down-signal — wrong creds or a wrong module looks identical
+to actually-down — but a dedicated ICMP/ping check is. Same batch-only,
+fail-open reasoning as `pin_tag` (and the same `honor_pins` flag gates both):
+an explicit single-host request always probes regardless, and a device
+missing from the query results (never monitored, or the query itself failed)
+is processed normally rather than skipped — only an explicit "down" verdict
+skips it. Reported as `skipped: "offline"`, and `modulator_liveness_query_up`
+tracks whether the last query itself succeeded.
+
 ### defaults
 
 Applied to every device before rules are evaluated:
@@ -427,6 +442,12 @@ Tag changes are batched with the module write when modules changed — one API c
 | `MODULATOR_NETBOX_REFRESH_INTERVAL` | `3600` | Seconds between NetBox device-count gauge refreshes (set `0` to disable) |
 | `PROMETHEUS_MULTIPROC_DIR` | auto | Multiprocess Prometheus metrics directory. Auto-set to `/tmp/modulator_metrics` when `MODULATOR_WORKERS>1`; set explicitly to override |
 | `MODULATOR_METRICS_PATH` | `/metrics` | Prometheus metrics endpoint path |
+| `MODULATOR_LIVENESS_URL` | unset | Prometheus-compatible API (e.g. VictoriaMetrics vmselect) to query for device liveness before a batch run probes it. Unset disables the feature entirely |
+| `MODULATOR_LIVENESS_QUERY` | `probe_success{job="network-netbox-ping"}` | Instant PromQL query; each series maps to a device via `MODULATOR_LIVENESS_LABEL` |
+| `MODULATOR_LIVENESS_LABEL` | `instance` | Which series label holds the matching key |
+| `MODULATOR_LIVENESS_KEY` | `name` | Which device attribute that key is — `name` or `ip` (`device.primary_ip`) |
+| `MODULATOR_LIVENESS_TIMEOUT` | `15` | Liveness query HTTP timeout, seconds |
+| `MODULATOR_LIVENESS_TLS_VERIFY` | `true` | Verify TLS on the liveness query endpoint |
 
 `modules.policy`, `auth.policy`, and field names are configured in `mapping.yaml`.
 They can be overridden per-run with CLI arguments but not via environment variables.
@@ -511,6 +532,7 @@ modulator_probe_duration_seconds
 modulator_probe_running
 modulator_probe_queued
 modulator_probe_queue_depth
+modulator_liveness_query_up
 modulator_netbox_devices_by_auth{profile="<name>"}
 modulator_netbox_devices_by_module{module="<name>"}
 modulator_netbox_devices_refresh_duration_seconds

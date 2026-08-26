@@ -94,6 +94,7 @@ from modulator import (
     SnmpExporterClient,
     __version__,
     compare_module_sets,
+    fetch_liveness,
 )
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -191,6 +192,12 @@ probe_queue_depth = Gauge(
     multiprocess_mode="livesum",
     **_reg,
 )
+liveness_query_up = Gauge(
+    "modulator_liveness_query_up",
+    "1 if the last liveness query (batch run) succeeded, 0 on error",
+    multiprocess_mode="livemax",
+    **_reg,
+)
 netbox_devices_by_auth = Gauge(
     "modulator_netbox_devices_by_auth",
     "Devices in NetBox per snmp auth profile (zero for profiles known to snmp-exporter but unused)",
@@ -285,6 +292,20 @@ _WAIT_TIMEOUT:  float          = float(os.getenv("MODULATOR_WAIT_TIMEOUT", "60")
 _DEVICE_PARALLELISM: int       = int(os.getenv("MODULATOR_DEVICE_PARALLELISM", "1"))
 _WORKERS: int                  = int(os.getenv("MODULATOR_WORKERS", "4"))
 _NETBOX_REFRESH_INTERVAL: int = int(os.getenv("MODULATOR_NETBOX_REFRESH_INTERVAL", "3600"))
+
+# Liveness gate: before a batch run probes a device, ask a Prometheus-compatible
+# API (VictoriaMetrics vmselect) whether it's actually up, and skip it if not —
+# SNMP itself isn't a reliable down-signal (wrong creds/module looks identical
+# to actually-down), but a dedicated ICMP check is. Disabled unless a URL is
+# configured; a query failure or a device missing from the results fails open
+# (processed normally), same reasoning as pin_tag. Mirrors bit-discobox's
+# DISCOBOX_LIVENESS_* config (fetch_liveness() is even the same function).
+_LIVENESS_URL:       Optional[str] = os.getenv("MODULATOR_LIVENESS_URL") or None
+_LIVENESS_QUERY:     str           = os.getenv("MODULATOR_LIVENESS_QUERY", 'probe_success{job="network-netbox-ping"}')
+_LIVENESS_LABEL:     str           = os.getenv("MODULATOR_LIVENESS_LABEL", "instance")
+_LIVENESS_KEY:       str           = os.getenv("MODULATOR_LIVENESS_KEY", "name").lower()  # "name" or "ip"
+_LIVENESS_TIMEOUT:   int           = int(os.getenv("MODULATOR_LIVENESS_TIMEOUT", "15"))
+_LIVENESS_TLS_VERIFY: bool         = os.getenv("MODULATOR_LIVENESS_TLS_VERIFY", "true").lower() != "false"
 
 # pynetbox filter keys: alphanumeric + underscore (allowing pynetbox's __operator suffix style).
 # Anything else (slashes, question marks, dots, etc.) is rejected before reaching NetBox.
@@ -512,6 +533,30 @@ def _cache_last_result(job_key: str, dry_run: bool, results: list) -> None:
         _last_result_cache[job_key] = (time.time(), dry_run, results)
 
 
+def _fetch_liveness_or_none() -> Optional[dict]:
+    """Fetch the liveness map for this run, or None if disabled/unavailable.
+
+    None means "don't filter anything" (fail open) — same meaning whether
+    liveness is disabled (_LIVENESS_URL unset) or the query just failed.
+    Updates modulator_liveness_query_up either way.
+    """
+    if not _LIVENESS_URL:
+        return None
+    try:
+        liveness = fetch_liveness(
+            _LIVENESS_URL, _LIVENESS_QUERY,
+            label=_LIVENESS_LABEL,
+            timeout=_LIVENESS_TIMEOUT,
+            verify_tls=_LIVENESS_TLS_VERIFY,
+        )
+        liveness_query_up.set(1)
+        return liveness
+    except Exception as exc:
+        logger.warning("Liveness query failed — proceeding without filtering: %s", exc)
+        liveness_query_up.set(0)
+        return None
+
+
 def _commit_cached_results(results: list) -> list:
     """Apply the NetBox writes for a previously cached dry-run result set,
     without re-probing. Mirrors the bookkeeping Modulator.run() would have
@@ -580,12 +625,17 @@ def _run_probe(
                 _probe_progress[job_key] = []
             try:
                 nb, snmp, engine, module_policy = _make_clients()
+                # Only bother querying liveness for batch runs — an explicit
+                # single-host request ignores it anyway (honor_pins=False).
+                liveness = _fetch_liveness_or_none() if honor_pins else None
                 mod = Modulator(
                     nb, snmp, engine,
                     dry_run=resolved_dry_run,
                     module_policy=module_policy,
                     device_parallelism=_DEVICE_PARALLELISM,
                     honor_pins=honor_pins,
+                    liveness=liveness,
+                    liveness_key=_LIVENESS_KEY,
                 )
                 devices = devices_fn(nb)
                 results = mod.run(
