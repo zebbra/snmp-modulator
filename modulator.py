@@ -526,6 +526,34 @@ class NetboxClient:
             payload["tags"] = self._compute_tags(dev, add_tags, remove_tags)
         dev.update(payload)
 
+    def bulk_set_modules(self, field_name: str, updates: dict, changelog_message: str,
+                         chunk_size: int = 100) -> dict:
+        """Set a module multi-select field on many devices via NetBox bulk PATCH
+        ({device_id: modules}), chunk_size devices per request. Only that one
+        custom field is sent — NetBox merges custom_fields on PATCH, so every
+        other field (incl. touch_field) stays as it is.
+
+        A failed chunk is retried device by device so one bad record can't
+        sink the other 99. Returns {device_id: error} for the ones that failed."""
+        def _item(device_id, modules):
+            return {"id": device_id, "custom_fields": {field_name: modules}, "changelog_message": changelog_message}
+
+        errors = {}
+        items = list(updates.items())
+        for i in range(0, len(items), chunk_size):
+            chunk = items[i:i + chunk_size]
+            try:
+                self.nb.dcim.devices.update([_item(d, m) for d, m in chunk])
+            except Exception as exc:
+                logger.warning("Bulk update of %d device(s) failed (%s) — retrying one by one", len(chunk), exc)
+                for d, m in chunk:
+                    try:
+                        self.nb.dcim.devices.update([_item(d, m)])
+                    except Exception as exc2:
+                        logger.error("Updating %s on device %d failed: %s", field_name, d, exc2)
+                        errors[d] = str(exc2)
+        return errors
+
     def update_polling(self, device_id: int,
                        interval: Optional[str] = None,
                        timeout: Optional[str] = None,
@@ -1193,6 +1221,14 @@ class MappingEngine:
         return expanded
 
 
+def _is_pinned(device: DeviceInfo, pin_tag: Optional[str]) -> bool:
+    """True if the device carries the mapping's pin_tag (a human set it deliberately)."""
+    if not pin_tag:
+        return False
+    raw_tags = _get_field(device.nb_device, "tags") or []
+    return pin_tag in {getattr(t, "slug", None) or str(t) for t in raw_tags}
+
+
 def _append_unique(value: str, lst: list) -> list:
     """Return lst with value appended as a last-resort fallback, deduped."""
     if value and (not lst or lst[-1] != value):
@@ -1504,15 +1540,12 @@ class Modulator:
 
         log = logging.getLogger(f"{APP_NAME}.{device.primary_ip}")
 
-        if self.honor_pins and self.engine.pin_tag:
-            raw_tags = _get_field(device.nb_device, "tags") or []
-            tag_slugs = {getattr(t, "slug", None) or str(t) for t in raw_tags}
-            if self.engine.pin_tag in tag_slugs:
-                log.info(
-                    "Device tagged %r — pinned by a human, skipping untouched (batch run)",
-                    self.engine.pin_tag,
-                )
-                return self._skip_result(device, "pinned")
+        if self.honor_pins and _is_pinned(device, self.engine.pin_tag):
+            log.info(
+                "Device tagged %r — pinned by a human, skipping untouched (batch run)",
+                self.engine.pin_tag,
+            )
+            return self._skip_result(device, "pinned")
 
         if self.honor_pins and self.liveness is not None:
             key = device.name if self.liveness_key == "name" else device.primary_ip
@@ -1878,3 +1911,140 @@ class Modulator:
                 test_results=[],
                 error=str(exc),
             )
+
+
+# ── Bulk module edit (no probing) ─────────────────────────────────────────────
+
+EDIT_PROFILES = ("normal", "fast")
+
+
+@dataclass
+class EditResult:
+    device_id: int
+    device_name: str
+    previous_modules: list
+    final_modules: list
+    added: list
+    removed: list
+    changed: bool
+    in_other_profile: list = field(default_factory=list)  # requested adds left alone: already in the other profile
+    skipped: Optional[str] = None   # "pinned"
+    error: Optional[str] = None
+
+
+def apply_module_edit(current: list, other_profile: list, add: list, remove: list) -> tuple:
+    """Pure set arithmetic for one device's module list: drop `remove`, then
+    append `add` (existing order kept, new modules appended in request order).
+
+    A module to add that already sits in the *other* profile's field is left
+    where it is — a module lives in exactly one profile, and an edit doesn't
+    move it. Returns (final, added, removed, in_other_profile)."""
+    removed = [m for m in current if m in remove]
+    final   = [m for m in current if m not in remove]
+    in_other, added = [], []
+    for m in dict.fromkeys(add):
+        if m in final:
+            continue
+        if m in other_profile:
+            in_other.append(m)
+        else:
+            added.append(m)
+    return final + added, added, removed, in_other
+
+
+class ModuleEditor:
+    """Bulk add/remove modules on the devices a NetBox filter selects — pure
+    NetBox edit, no SNMP probing, no mapping.yaml rules. Meant for fast
+    fleet-wide rollouts (e.g. add if_updown_state wherever if_full already is)
+    that a full re-probe of thousands of devices would take hours for.
+
+    Deliberately leaves touch_field alone: it means "last probed", and this
+    isn't a probe. Honors pin_tag like any batch run."""
+
+    def __init__(
+        self,
+        nb: NetboxClient,
+        engine: "MappingEngine",
+        profile: str = "normal",
+        dry_run: bool = False,
+        honor_pins: bool = True,
+        chunk_size: int = 100,
+    ):
+        if profile not in EDIT_PROFILES:
+            raise ValueError(f"profile must be one of {EDIT_PROFILES}, got {profile!r}")
+        if profile == "fast" and not engine.fast_module_field:
+            raise ValueError("profile=fast requested but modules.fast.field is not configured in mapping.yaml")
+        self.nb         = nb
+        self.engine     = engine
+        self.profile    = profile
+        self.dry_run    = dry_run
+        self.honor_pins = honor_pins
+        self.chunk_size = chunk_size
+
+    @property
+    def field_name(self) -> str:
+        return self.engine.fast_module_field if self.profile == "fast" else self.engine.module_field
+
+    def unknown_modules(self, modules: list, known_modules: Optional[list] = None) -> list:
+        """Modules that can't be added: not a NetBox choice for the target field,
+        or (when known_modules is given) not defined in snmp-exporter."""
+        valid = self.nb._valid_modules_fast if self.profile == "fast" else self.nb._valid_modules
+        return [
+            m for m in modules
+            if (valid is not None and m not in valid) or (known_modules and m not in known_modules)
+        ]
+
+    def run(self, devices: list, add: list, remove: list, add_only_if_removed: bool = False,
+            callbacks: Optional[Callbacks] = None) -> list:
+        """add_only_if_removed makes it a replace: a device that carried none of
+        `remove` doesn't get `add` either."""
+        if callbacks is None:
+            callbacks = Callbacks()
+        add, remove = list(dict.fromkeys(add)), set(remove)
+        changelog = f"{APP_NAME} module edit: " + " ".join([f"+{m}" for m in add] + [f"-{m}" for m in sorted(remove)])
+
+        results, updates = [], {}
+        for device in devices:
+            if self.profile == "fast":
+                current, other = device.current_modules_fast, device.current_modules
+            else:
+                current, other = device.current_modules, device.current_modules_fast
+            if self.honor_pins and _is_pinned(device, self.engine.pin_tag):
+                results.append(EditResult(
+                    device.id, device.name, list(current), list(current), [], [], False, skipped="pinned",
+                ))
+                continue
+            final, added, removed, in_other = apply_module_edit(current, other, add, remove)
+            if add_only_if_removed and not removed:
+                final, added, in_other = list(current), [], []
+            changed = bool(added or removed)
+            results.append(EditResult(
+                device.id, device.name, list(current), final, added, removed, changed, in_other_profile=in_other,
+            ))
+            if changed:
+                updates[device.id] = final
+
+        errors = {}
+        if updates and not self.dry_run:
+            errors = self.nb.bulk_set_modules(self.field_name, updates, changelog, chunk_size=self.chunk_size)
+
+        for r in results:
+            if r.device_id in errors:
+                r.error = errors[r.device_id]
+                continue
+            if r.skipped:
+                continue
+            callbacks.netbox_update(action="changed" if r.changed else "unchanged")
+            if not self.dry_run:
+                for m in r.added:
+                    callbacks.module_changed(m, "added")
+                for m in r.removed:
+                    callbacks.module_changed(m, "removed")
+
+        logger.info(
+            "Module edit complete (%s%s): %d device(s)  changed=%d pinned=%d errors=%d  [%s]",
+            self.field_name, ", DRY RUN" if self.dry_run else "", len(results),
+            sum(1 for r in results if r.changed and not r.error),
+            sum(1 for r in results if r.skipped), len(errors), changelog,
+        )
+        return results

@@ -658,3 +658,128 @@ def test_health_includes_module_mismatch_counts_but_not_full_lists() -> None:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ── /modules/add|remove|replace ──────────────────────────────────────────────
+
+def _edit_engine(tmp_path):
+    from modulator import MappingEngine
+    path = tmp_path / "mapping.yaml"
+    path.write_text("pin_tag: pin-snmp\nmodules:\n  field: snmp_exporter_module\nrules: []\n")
+    return MappingEngine(str(path))
+
+
+def _edit_device(id, modules):
+    from modulator import DeviceInfo
+    return DeviceInfo(
+        id=id, name=f"sw{id}", primary_ip=f"10.0.0.{id}", snmp_auth_profile="v2",
+        current_modules=list(modules), nb_device=SimpleNamespace(tags=[]),
+    )
+
+
+class FakeEditNetboxClient:
+    def __init__(self, valid=None):
+        self._valid_modules = valid
+        self._valid_modules_fast = None
+        self.bulk_calls: list = []
+
+    def bulk_set_modules(self, field_name, updates, changelog_message, chunk_size=100):
+        self.bulk_calls.append((field_name, dict(updates), changelog_message))
+        return {}
+
+
+def _request(query: str):
+    from starlette.requests import Request
+    return Request({"type": "http", "method": "POST", "path": "/", "query_string": query.encode(), "headers": []})
+
+
+class FakeBackgroundTasks:
+    def __init__(self):
+        self.tasks: list = []
+
+    def add_task(self, fn, *args, **kwargs):
+        self.tasks.append((fn, args, kwargs))
+
+
+@pytest.fixture
+def edit_env(tmp_path, monkeypatch):
+    engine = _edit_engine(tmp_path)
+    nb = FakeEditNetboxClient(valid=frozenset({"if_full", "if_updown_state", "if_status", "cisco-generic"}))
+    fetched: list = []
+
+    def get_devices(**kw):
+        fetched.append(kw)
+        return [_edit_device(1, ["if_full"]), _edit_device(2, ["if_status"])]
+
+    nb.get_devices = get_devices
+    snmp = SimpleNamespace(modules=["if_full", "if_updown_state", "if_status", "cisco-generic"])
+    monkeypatch.setattr(server, "_make_clients", lambda: (nb, snmp, engine, "drop"))
+    monkeypatch.setattr(server, "_EDIT_JOB_DIR", str(tmp_path / "jobs"))
+    return SimpleNamespace(nb=nb, fetched=fetched)
+
+
+def _start(endpoint, query: str):
+    bg = FakeBackgroundTasks()
+    resp = asyncio.run(endpoint(_request(query), bg))
+    return resp, bg
+
+
+def _run_queued(bg) -> None:
+    for fn, args, kwargs in bg.tasks:
+        fn(*args, **kwargs)
+
+
+def test_modules_add_runs_job_and_result_is_pollable(edit_env) -> None:
+    resp, bg = _start(server.modules_add, "module=if_updown_state&cf_snmp_exporter_module=if_full")
+    job = resp["job"]
+    assert resp["status"] == "running" and resp["result_url"] == f"/modules/result?job={job}"
+
+    running = asyncio.run(server.modules_result(job=job))
+    assert running.status_code == 202
+
+    _run_queued(bg)
+    done = asyncio.run(server.modules_result(job=job))
+    assert done["status"] == "done"
+    assert done["summary"]["changed"] == 2
+    assert edit_env.fetched == [{"cf_snmp_exporter_module": "if_full"}]
+    assert edit_env.nb.bulk_calls[0][1] == {1: ["if_full", "if_updown_state"], 2: ["if_status", "if_updown_state"]}
+
+
+def test_modules_add_requires_a_filter(edit_env) -> None:
+    with pytest.raises(server.HTTPException) as exc_info:
+        _start(server.modules_add, "module=if_updown_state")
+    assert exc_info.value.status_code == 400
+
+
+def test_modules_add_rejects_unknown_module_before_queueing(edit_env) -> None:
+    with pytest.raises(server.HTTPException) as exc_info:
+        _start(server.modules_add, "module=if_typo&site=dc1")
+    assert exc_info.value.status_code == 400
+    assert "if_typo" in exc_info.value.detail
+
+
+def test_modules_remove_narrows_filter_to_devices_carrying_the_module(edit_env) -> None:
+    resp, bg = _start(server.modules_remove, "module=cisco-generic")
+    assert resp["filter"] == {"cf_snmp_exporter_module": "cisco-generic"}
+    resp, _ = _start(server.modules_remove, "module=cisco-generic,if_status&site=dc1")
+    assert resp["filter"] == {"site": "dc1", "cf_snmp_exporter_module": ["cisco-generic", "if_status"]}
+
+
+def test_modules_replace_only_touches_devices_that_had_an_old_module(edit_env) -> None:
+    resp, bg = _start(server.modules_replace, "old=if_status&new=if_full")
+    _run_queued(bg)
+    done = asyncio.run(server.modules_result(job=resp["job"]))
+    assert done["summary"]["changed"] == 1
+    assert edit_env.nb.bulk_calls[0][1] == {2: ["if_full"]}
+
+
+def test_modules_replace_rejects_overlap(edit_env) -> None:
+    with pytest.raises(server.HTTPException) as exc_info:
+        _start(server.modules_replace, "old=if_full&new=if_full")
+    assert exc_info.value.status_code == 400
+
+
+def test_modules_result_404_for_unknown_job(edit_env) -> None:
+    with pytest.raises(server.HTTPException) as exc_info:
+        asyncio.run(server.modules_result(job="0" * 32))
+    assert exc_info.value.status_code == 404

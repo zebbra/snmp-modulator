@@ -433,6 +433,7 @@ Tag changes are batched with the module write when modules changed — one API c
 | `MAPPING_FILE` | `mapping.yaml` | Path to mapping config |
 | `MODULATOR_DRY_RUN` | `false` | Log changes without writing to NetBox |
 | `MODULATOR_DRY_RUN_CACHE_TTL` | `300` | Seconds a dry-run `/probe` result is remembered for; a plain (non-dry-run) `/probe` call for the *same* host within this window commits it for real without re-probing. `0` disables the cache |
+| `MODULATOR_EDIT_RESULT_TTL` | `86400` | Seconds a finished `/modules/add\|remove\|replace` job stays available via `GET /modules/result?job=<id>` |
 | `MODULATOR_PROBE_RESULT_TTL` | `300` | Seconds a finished probe result stays available via `GET /probe/result?host=X` before that endpoint 404s and a new probe must be submitted |
 | `MODULATOR_AUTH_TOKEN` | unset | Bearer token for `/probe` endpoints (disabled if unset) |
 | `MODULATOR_PORT` | `8080` | Server listen port |
@@ -481,6 +482,10 @@ Options:
 | `GET/POST /probe?host=<ip\|name>` | Probe a single device |
 | `GET /probe/result?host=<ip\|name>` | Poll a queued probe's progress or finished result |
 | `GET/POST /probe/netbox?<filter>` | Probe devices matching any NetBox filter |
+| `GET/POST /modules/add?module=<m>&<filter>` | Add module(s) — no probing, see [Bulk module edits](#bulk-module-edits) |
+| `GET/POST /modules/remove?module=<m>[&<filter>]` | Remove module(s) — no probing |
+| `GET/POST /modules/replace?old=<m>&new=<m>[&<filter>]` | Replace module(s) — no probing |
+| `GET /modules/result?job=<id>` | Poll a `/modules/*` job |
 | `GET /health` | Liveness check |
 | `GET /metrics` | Prometheus metrics |
 | `GET /docs` | Swagger UI |
@@ -516,6 +521,47 @@ is populated; everything else is null/empty until `status` flips to `"done"`.
 Keyed by `host`, same as `/probe` — no job id to track, just re-GET the same
 URL. `MODULATOR_PROBE_RESULT_TTL` (default 300s) controls how long a finished
 result stays available to poll for.
+
+### Bulk module edits
+
+For a fast fleet-wide rollout (e.g. a new module that should go out *now*,
+without re-probing thousands of devices), `/modules/add`, `/modules/remove`
+and `/modules/replace` edit the module field directly in NetBox — no SNMP
+probing, no `mapping.yaml` rules. One NetBox bulk PATCH per 100 devices, so
+10k devices take a minute or two instead of hours.
+
+```
+POST /modules/add?module=if_updown_state&cf_snmp_exporter_module=if_full
+POST /modules/remove?module=cisco-generic
+POST /modules/replace?old=if_status,if_error,if_traffic&new=if_full
+POST /modules/add?module=if_updown_state&cf_snmp_exporter_module=if_full&cf_snmp_exporter_module__n=if_updown_state&site=dc1
+```
+
+- `module`, `old`, `new` take comma-separated or repeated values; `profile=fast`
+  targets the fast-profile field (`modules.fast.field`) instead of the normal one.
+- Every other query parameter is a NetBox filter, exactly as for `/probe/netbox`.
+  `/modules/add` requires one; `/modules/remove` and `/modules/replace` always
+  narrow the query to devices carrying one of the removed modules
+  (`cf_<field>=<module>`), so a filter there is optional.
+- `replace` only adds `new` on a device that actually had one of `old` — a
+  broad filter never hands `new` to a device that didn't have the old modules.
+- A module to add that already sits in the *other* profile's field is left
+  where it is (reported as `in_other_profile`).
+- Modules to add are validated against the NetBox choice set and snmp-exporter
+  before anything is queued (400 on a typo).
+- Pinned devices are skipped. `touch_field` is **not** set — it means "last
+  probed", and this isn't a probe. Changes carry the changelog message
+  `SNMPModulator module edit: +if_updown_state -…`. `MODULATOR_DRY_RUN` is honored.
+
+Always async — returns 202 with a `job` id; poll `GET /modules/result?job=<id>`
+(202 while running, 200 once `done`/`failed`). The result has per-device
+counts and lists only the devices that changed, were skipped or errored.
+Job state lives in files under `PROMETHEUS_MULTIPROC_DIR`, so polling works
+across uvicorn workers.
+
+**Not sticky:** the next probe run with `modules.policy: drop` recomputes the
+field from `mapping.yaml` and drops modules no rule produces. Add a matching
+rule, or the edit is undone device by device as they're re-probed.
 
 ---
 

@@ -5,6 +5,11 @@ snmp-modulator server — FastAPI probe trigger + Prometheus metrics.
 Endpoints:
   GET/POST /probe?host=<ip_or_fqdn>          Probe a single device by IP or name
   GET/POST /probe/netbox?<filter_params>     Probe devices matching any NetBox filter
+  GET/POST /modules/add?module=&<filter>     Add module(s), no probing (async; filter required)
+  GET/POST /modules/remove?module=[&<filter>] Remove module(s), no probing (async)
+  GET/POST /modules/replace?old=&new=[&<filter>]
+                                             Replace module(s), no probing (async)
+  GET      /modules/result?job=<id>          Poll a /modules/* job
   GET      /rules                            Loaded mapping.yaml rules/config as JSON
                                                (add ?format=html for a browsable page)
   GET      /stats                            Device counts by auth/module + module mismatch, as JSON
@@ -37,11 +42,14 @@ for real — no re-probing. One-shot: the cache entry is consumed on that commit
 
 import asyncio
 import html
+import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import Annotated, Any, Optional
@@ -86,10 +94,12 @@ from prometheus_client.multiprocess import MultiProcessCollector
 
 from modulator import (
     APP_NAME,
+    EDIT_PROFILES,
     Callbacks,
     MappingEngine,
     ModulationResult,
     Modulator,
+    ModuleEditor,
     NetboxClient,
     SnmpExporterClient,
     __version__,
@@ -859,6 +869,256 @@ async def probe_netbox(
     return {"status": "queued", "filter": filter_params}
 
 
+# ── Bulk module edit ──────────────────────────────────────────────────────────
+
+# Edit jobs keep their state in JSON files rather than an in-process dict like
+# _last_result_cache: an edit over thousands of devices is polled for minutes,
+# and with MODULATOR_WORKERS>1 each poll can land on a different worker.
+_EDIT_JOB_DIR: str = os.path.join(_MULTIPROC_DIR or tempfile.gettempdir(), "modulator-edit-jobs")
+_EDIT_RESULT_TTL: float = float(os.getenv("MODULATOR_EDIT_RESULT_TTL", "86400"))
+_EDIT_JOB_ID = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _write_edit_job(job_id: str, state: dict) -> None:
+    os.makedirs(_EDIT_JOB_DIR, exist_ok=True)
+    path = os.path.join(_EDIT_JOB_DIR, f"{job_id}.json")
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, path)
+
+
+def _read_edit_job(job_id: str) -> Optional[dict]:
+    try:
+        with open(os.path.join(_EDIT_JOB_DIR, f"{job_id}.json")) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _prune_edit_jobs() -> None:
+    try:
+        names = os.listdir(_EDIT_JOB_DIR)
+    except FileNotFoundError:
+        return
+    cutoff = time.time() - _EDIT_RESULT_TTL
+    for name in names:
+        path = os.path.join(_EDIT_JOB_DIR, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def _split_modules(values: list) -> list:
+    """Accept both ?add=a,b and ?add=a&add=b."""
+    return list(dict.fromkeys(m.strip() for v in values for m in v.split(",") if m.strip()))
+
+
+def _run_edit(job_id: str, state: dict, nb: NetboxClient, editor: ModuleEditor, filter_params: dict) -> None:
+    start = time.time()
+    try:
+        devices = nb.get_devices(**filter_params)
+        results = editor.run(
+            devices, state["add"], state["remove"],
+            add_only_if_removed=state["op"] == "replace", callbacks=_ServerCallbacks(),
+        )
+        state["summary"] = {
+            "matched":   len(results),
+            "changed":   sum(1 for r in results if r.changed and not r.error),
+            "unchanged": sum(1 for r in results if not r.changed and not r.skipped),
+            "pinned":    sum(1 for r in results if r.skipped == "pinned"),
+            "in_other_profile": sum(1 for r in results if r.in_other_profile),
+            "errors":    sum(1 for r in results if r.error),
+        }
+        # Unchanged devices are only counted, not listed — on a fleet-wide
+        # edit that list is thousands of entries of nothing.
+        state["devices"] = [asdict(r) for r in results if r.changed or r.skipped or r.error or r.in_other_profile]
+        state["status"] = "done"
+    except Exception as exc:
+        logger.exception("Module edit job %s failed: %s", job_id, exc)
+        state["status"] = "failed"
+        state["error"] = str(exc)
+    state["duration_seconds"] = round(time.time() - start, 1)
+    _write_edit_job(job_id, state)
+    logger.info("Module edit job %s %s in %.1fs", job_id, state["status"], state["duration_seconds"])
+
+
+def _query_groups(request: Request) -> dict:
+    grouped: dict = {}
+    for k, v in request.query_params.multi_items():
+        grouped.setdefault(k, []).append(v)
+    return grouped
+
+
+async def _start_edit(
+    background_tasks: BackgroundTasks,
+    grouped: dict,
+    op: str,
+    add: list,
+    remove: list,
+    filter_required: bool,
+) -> dict:
+    """Shared body of /modules/add, /modules/remove and /modules/replace:
+    validate, resolve the target field, queue the job, return its id.
+    `grouped` is the query string minus the op's own params."""
+    profile = grouped.pop("profile", ["normal"])[-1]
+    filter_params = {k: v[0] if len(v) == 1 else v for k, v in grouped.items()}
+
+    if overlap := sorted(set(add) & set(remove)):
+        raise HTTPException(status_code=400, detail=f"module(s) {overlap} both added and removed")
+    if profile not in EDIT_PROFILES:
+        raise HTTPException(status_code=400, detail=f"profile must be one of {list(EDIT_PROFILES)}")
+    if filter_required and not filter_params:
+        raise HTTPException(
+            status_code=400,
+            detail="a NetBox filter is required (e.g. cf_snmp_exporter_module=if_full) — refusing a fleet-wide add",
+        )
+    bad = [k for k in filter_params if not _VALID_FILTER_KEY.match(k)]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"invalid filter key(s) {bad!r}")
+
+    def _prepare():
+        nb, snmp, engine, _ = _make_clients()
+        editor = ModuleEditor(nb, engine, profile=profile, dry_run=_DRY_RUN)
+        return nb, editor, editor.unknown_modules(add, snmp.modules)
+
+    try:
+        nb, editor, unknown = await asyncio.to_thread(_prepare)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown module(s) {unknown} — not a NetBox choice for {editor.field_name} or not in snmp-exporter",
+        )
+
+    # Removing only touches devices that carry one of the modules, so narrow the
+    # NetBox query to exactly those (repeated cf_ values are OR'd) unless the
+    # caller already filters on that field — avoids fetching the whole fleet.
+    cf_key = f"cf_{editor.field_name}"
+    if remove and cf_key not in filter_params:
+        filter_params[cf_key] = remove if len(remove) > 1 else remove[0]
+
+    _prune_edit_jobs()
+    job_id = uuid.uuid4().hex
+    state = {
+        "status": "running", "job": job_id, "op": op, "started": time.time(),
+        "field": editor.field_name, "profile": profile, "add": add, "remove": remove,
+        "filter": filter_params, "dry_run": _DRY_RUN,
+    }
+    _write_edit_job(job_id, state)
+    background_tasks.add_task(_run_edit, job_id, dict(state), nb, editor, filter_params)
+    logger.info("Module %s job %s queued: add=%s remove=%s field=%s filter=%s",
+                op, job_id, add, remove, editor.field_name, filter_params)
+    return {**state, "result_url": f"/modules/result?job={job_id}"}
+
+
+_EDIT_DOC_COMMON = """
+    No probing and no mapping.yaml rules — a plain NetBox edit, for a fast
+    fleet-wide rollout. Every query parameter other than the ones above is a
+    NetBox filter, exactly as for `/probe/netbox`. `profile=fast` targets the
+    fast-profile field instead of the normal one; a module to add that already
+    sits in the other profile's field stays where it is. Pinned devices are
+    skipped, `touch_field` is not set (this isn't a probe), and the server-wide
+    MODULATOR_DRY_RUN is honored.
+
+    Returns 202 with a `job` id right away; poll `/modules/result?job=<id>`.
+"""
+
+
+@app.api_route(
+    "/modules/add",
+    methods=["GET", "POST"],
+    status_code=202,
+    dependencies=[Depends(require_auth)],
+    summary="Add module(s) to devices matching a NetBox filter — no probing",
+)
+async def modules_add(request: Request, background_tasks: BackgroundTasks) -> dict:
+    grouped = _query_groups(request)
+    add = _split_modules(grouped.pop("module", []))
+    if not add:
+        raise HTTPException(status_code=400, detail="module parameter required")
+    return await _start_edit(background_tasks, grouped, "add", add, [], filter_required=True)
+
+
+modules_add.__doc__ = """
+    Add `module` (comma-separated or repeated) to every device the filter
+    selects. A filter is required:
+
+        /modules/add?module=if_updown_state&cf_snmp_exporter_module=if_full
+""" + _EDIT_DOC_COMMON
+
+
+@app.api_route(
+    "/modules/remove",
+    methods=["GET", "POST"],
+    status_code=202,
+    dependencies=[Depends(require_auth)],
+    summary="Remove module(s) from devices — no probing",
+)
+async def modules_remove(request: Request, background_tasks: BackgroundTasks) -> dict:
+    grouped = _query_groups(request)
+    remove = _split_modules(grouped.pop("module", []))
+    if not remove:
+        raise HTTPException(status_code=400, detail="module parameter required")
+    return await _start_edit(background_tasks, grouped, "remove", [], remove, filter_required=False)
+
+
+modules_remove.__doc__ = """
+    Remove `module` (comma-separated or repeated). The filter is optional —
+    the query is always narrowed to devices that carry one of the modules:
+
+        /modules/remove?module=cisco-generic
+        /modules/remove?module=cisco-generic&site=dc1
+""" + _EDIT_DOC_COMMON
+
+
+@app.api_route(
+    "/modules/replace",
+    methods=["GET", "POST"],
+    status_code=202,
+    dependencies=[Depends(require_auth)],
+    summary="Replace module(s) with others on devices — no probing",
+)
+async def modules_replace(request: Request, background_tasks: BackgroundTasks) -> dict:
+    grouped = _query_groups(request)
+    old = _split_modules(grouped.pop("old", []))
+    new = _split_modules(grouped.pop("new", []))
+    if not old or not new:
+        raise HTTPException(status_code=400, detail="old and new parameters required")
+    return await _start_edit(background_tasks, grouped, "replace", new, old, filter_required=False)
+
+
+modules_replace.__doc__ = """
+    On every device carrying at least one of `old`, remove all of `old` and
+    add `new` (both comma-separated or repeated). A device with none of `old`
+    is left alone, never gets `new`. The filter is optional, as for remove:
+
+        /modules/replace?old=if_status,if_error,if_traffic&new=if_full
+""" + _EDIT_DOC_COMMON
+
+
+@app.get(
+    "/modules/result",
+    dependencies=[Depends(require_auth)],
+    summary="Poll a /modules/add|remove|replace job",
+)
+async def modules_result(
+    job: Annotated[Optional[str], Query(description="Job id returned by /modules/add|remove|replace")] = None,
+) -> Any:
+    """202 while running, 200 once done (or failed), 404 for an unknown/expired job."""
+    if not job or not _EDIT_JOB_ID.match(job):
+        raise HTTPException(status_code=400, detail="job parameter required (as returned by /modules/add etc.)")
+    state = _read_edit_job(job)
+    if state is None:
+        raise HTTPException(status_code=404, detail=f"no edit job {job!r} (unknown or expired)")
+    if state["status"] == "running":
+        return JSONResponse(status_code=202, content=state)
+    return state
+
+
 def _rules_html(snap: dict) -> str:
     """Render a MappingEngine.snapshot() dict as a dashboard-styled HTML page."""
     esc = lambda s: html.escape(str(s))  # noqa: E731
@@ -1055,6 +1315,11 @@ async def index() -> str:
   <tr><th>Method</th><th>Path</th><th>Description</th></tr>
   <tr><td>GET/POST</td><td>/probe</td><td>Probe a single device by IP or name</td></tr>
   <tr><td>GET/POST</td><td>/probe/netbox</td><td>Probe devices matching a NetBox filter</td></tr>
+  <tr><td>GET/POST</td><td>/modules/add</td><td>Add module(s) on devices matching a NetBox filter — no probing</td></tr>
+  <tr><td>GET/POST</td><td>/modules/remove</td><td>Remove module(s) — no probing</td></tr>
+  <tr><td>GET/POST</td><td>/modules/replace</td><td>Replace module(s) with others — no probing</td></tr>
+  <tr><td>GET</td><td>/modules/result</td>
+      <td>Poll a <code>/modules/*</code> job (<code>?job=&lt;id&gt;</code>)</td></tr>
   <tr><td>GET</td><td><a href=/rules?format=html>/rules</a></td>
       <td>Loaded mapping.yaml rules (JSON by default; link goes to <code>?format=html</code>)</td></tr>
   <tr><td>GET</td><td><a href=/stats>/stats</a></td>
@@ -1073,6 +1338,9 @@ async def index() -> str:
   <li><code>/probe/netbox?role_id=4&amp;last_updated__lt=2025-10-01</code></li>
   <li><code>/probe/netbox?site=dc1&amp;tag=snmp-ready</code></li>
   <li><code>/probe/netbox?manufacturer=cisco</code></li>
+  <li><code>/modules/add?module=if_updown_state&amp;cf_snmp_exporter_module=if_full</code></li>
+  <li><code>/modules/remove?module=cisco-generic</code></li>
+  <li><code>/modules/replace?old=if_status,if_error,if_traffic&amp;new=if_full</code></li>
 </ul>
 
 <h2>Module mismatch {mismatch_badge}</h2>
