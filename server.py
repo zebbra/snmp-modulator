@@ -896,6 +896,21 @@ def _read_edit_job(job_id: str) -> Optional[dict]:
         return None
 
 
+def _list_edit_jobs() -> list:
+    """Every unexpired job, newest first, without the per-device list."""
+    try:
+        names = os.listdir(_EDIT_JOB_DIR)
+    except FileNotFoundError:
+        return []
+    jobs = []
+    for name in names:
+        job_id = name.removesuffix(".json")
+        if name.endswith(".json") and _EDIT_JOB_ID.match(job_id) and (state := _read_edit_job(job_id)):
+            state.pop("devices", None)
+            jobs.append({**state, "result_url": f"/modules/result?job={job_id}"})
+    return sorted(jobs, key=lambda s: s.get("started", 0), reverse=True)
+
+
 def _prune_edit_jobs() -> None:
     try:
         names = os.listdir(_EDIT_JOB_DIR)
@@ -1103,14 +1118,18 @@ modules_replace.__doc__ = """
 @app.get(
     "/modules/result",
     dependencies=[Depends(require_auth)],
-    summary="Poll a /modules/add|remove|replace job",
+    summary="Poll a /modules/add|remove|replace job, or list all jobs",
 )
 async def modules_result(
     job: Annotated[Optional[str], Query(description="Job id returned by /modules/add|remove|replace")] = None,
 ) -> Any:
-    """202 while running, 200 once done (or failed), 404 for an unknown/expired job."""
-    if not job or not _EDIT_JOB_ID.match(job):
-        raise HTTPException(status_code=400, detail="job parameter required (as returned by /modules/add etc.)")
+    """202 while running, 200 once done (or failed), 404 for an unknown/expired job.
+    Without `job`: every unexpired job, newest first, without the per-device list."""
+    if not job:
+        _prune_edit_jobs()
+        return {"jobs": _list_edit_jobs()}
+    if not _EDIT_JOB_ID.match(job):
+        raise HTTPException(status_code=400, detail=f"invalid job id {job!r}")
     state = _read_edit_job(job)
     if state is None:
         raise HTTPException(status_code=404, detail=f"no edit job {job!r} (unknown or expired)")

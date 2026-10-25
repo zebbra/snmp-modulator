@@ -779,6 +779,19 @@ def test_modules_replace_rejects_overlap(edit_env) -> None:
     assert exc_info.value.status_code == 400
 
 
+def test_modules_result_without_job_lists_jobs_newest_first(edit_env) -> None:
+    assert asyncio.run(server.modules_result()) == {"jobs": []}
+    first, bg = _start(server.modules_add, "module=if_updown_state&cf_snmp_exporter_module=if_full")
+    _run_queued(bg)
+    second, _ = _start(server.modules_remove, "module=cisco-generic")
+
+    jobs = asyncio.run(server.modules_result())["jobs"]
+    assert [j["job"] for j in jobs] == [second["job"], first["job"]]
+    assert [j["status"] for j in jobs] == ["running", "done"]
+    assert "devices" not in jobs[1] and jobs[1]["summary"]["changed"] == 2
+    assert jobs[1]["result_url"] == f"/modules/result?job={first['job']}"
+
+
 def test_modules_result_404_for_unknown_job(edit_env) -> None:
     with pytest.raises(server.HTTPException) as exc_info:
         asyncio.run(server.modules_result(job="0" * 32))

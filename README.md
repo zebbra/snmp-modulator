@@ -485,7 +485,7 @@ Options:
 | `GET/POST /modules/add?module=<m>&<filter>` | Add module(s) — no probing, see [Bulk module edits](#bulk-module-edits) |
 | `GET/POST /modules/remove?module=<m>[&<filter>]` | Remove module(s) — no probing |
 | `GET/POST /modules/replace?old=<m>&new=<m>[&<filter>]` | Replace module(s) — no probing |
-| `GET /modules/result?job=<id>` | Poll a `/modules/*` job |
+| `GET /modules/result[?job=<id>]` | Poll a `/modules/*` job; without `job`, list all jobs |
 | `GET /health` | Liveness check |
 | `GET /metrics` | Prometheus metrics |
 | `GET /docs` | Swagger UI |
@@ -535,6 +535,7 @@ POST /modules/add?module=if_updown_state&cf_snmp_exporter_module=if_full
 POST /modules/remove?module=cisco-generic
 POST /modules/replace?old=if_status,if_error,if_traffic&new=if_full
 POST /modules/add?module=if_updown_state&cf_snmp_exporter_module=if_full&cf_snmp_exporter_module__n=if_updown_state&site=dc1
+POST /modules/add?module=if_updown_state&profile=fast&manufacturer=fortinet&name__nic=p0h&cf_snmp_auth_profile__empty=false
 ```
 
 - `module`, `old`, `new` take comma-separated or repeated values; `profile=fast`
@@ -553,9 +554,11 @@ POST /modules/add?module=if_updown_state&cf_snmp_exporter_module=if_full&cf_snmp
   probed", and this isn't a probe. Changes carry the changelog message
   `SNMPModulator module edit: +if_updown_state -…`. `MODULATOR_DRY_RUN` is honored.
 
-Always async — returns 202 with a `job` id; poll `GET /modules/result?job=<id>`
-(202 while running, 200 once `done`/`failed`). The result has per-device
-counts and lists only the devices that changed, were skipped or errored.
+Always async — returns 202 with a `job` id and its `result_url`; poll
+`GET /modules/result?job=<id>` (202 while running, 200 once `done`/`failed`).
+The result has per-device counts and lists only the devices that changed,
+were skipped or errored. `GET /modules/result` without `job` lists every
+unexpired job, newest first, with its summary but without the device list.
 Job state lives in files under `PROMETHEUS_MULTIPROC_DIR`, so polling works
 across uvicorn workers.
 
