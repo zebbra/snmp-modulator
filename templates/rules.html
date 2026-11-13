@@ -1,0 +1,62 @@
+{%- macro mlist(items) -%}<ul class="tree">{% for m in items %}<li>{{ m }}</li>{% endfor %}</ul>{%- endmacro -%}
+{%- macro modules(m, prefix="") -%}
+{%- for key in ["add", "try", "block"] if m[key] %}<li><span class="k-{{ key }}">{{ prefix }}{{ key }}</span>{{ mlist(m[key]) }}</li>{% endfor %}
+{%- if m.interval or m.timeout %}<li>{{ prefix }}floor: interval {{ m.interval or "–" }}, timeout {{ m.timeout or "–" }}</li>{% endif %}
+{%- endmacro -%}
+{%- macro handlers(h) -%}
+{%- for key, label in [("add_tag", "+tag"), ("remove_tag", "−tag"), ("notify", "notify")] if h and h[key] %}<li>{{ label }}{{ mlist(h[key]) }}</li>{% endfor %}
+{%- endmacro -%}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>snmp-modulator rules</title>
+{% include "_style.html" %}
+</head>
+<body>
+
+<h1>snmp-modulator <small>v{{ version }}</small> <small>rules</small></h1>
+<p><a href="/">← dashboard</a> · <a href="/rules">JSON</a> <span class="muted">· reloaded from {{ mapping_file }} on every call</span></p>
+
+<h2>Config</h2>
+<table>
+  <tr><td>module_field / auth_field</td><td>{{ s.module_field }} / {{ s.auth_field }}</td></tr>
+  <tr><td>interval_field / timeout_field</td><td>{{ s.interval_field or "–" }} / {{ s.timeout_field or "–" }}</td></tr>
+  <tr><td>touch_field</td><td>{{ s.touch_field or "–" }}</td></tr>
+  <tr><td>pin_tag</td><td>{{ s.pin_tag or "–" }}</td></tr>
+  <tr><td>default_interval / default_timeout</td><td>{{ s.default_interval }} / {{ s.default_timeout }}</td></tr>
+  <tr><td>fast_module_field</td><td>{{ s.fast_module_field or "–" }}</td></tr>
+  <tr><td>fast_interval_field / fast_timeout_field</td><td>{{ s.fast_interval_field or "–" }} / {{ s.fast_timeout_field or "–" }}</td></tr>
+  <tr><td>fast_default_interval / fast_default_timeout</td><td>{{ s.fast_default_interval }} / {{ s.fast_default_timeout }}</td></tr>
+  <tr><td>module_policy / auth_policy</td><td>{{ s.module_policy }} / {{ s.auth_policy }}</td></tr>
+  <tr><td>auth_probe_module</td><td>{{ s.auth_probe_module }}</td></tr>
+</table>
+
+<h2>Defaults</h2>
+<table>
+  <tr><td>modules</td><td><ul class="tree top">{{ modules(s.defaults.modules) }}</ul>{% if not (s.defaults.modules.add or s.defaults.modules.try or s.defaults.modules.block) %}–{% endif %}</td></tr>
+  <tr><td>auth try</td><td>{{ mlist(s.defaults.auth.try) if s.defaults.auth.try else "–" }}</td></tr>
+</table>
+
+<h2>Rules ({{ s.rules|length }})</h2>
+<table>
+  <tr><th>Name</th><th>Match</th><th>Modules</th><th>Auth</th><th>Handlers</th></tr>
+  {% for r in s.rules %}
+  <tr><td>{{ r.name }}</td>
+    <td>{% if r.match %}<ul class="tree top">{% for k, v in r.match.items() %}<li><code>{{ k }}</code> ~ <code>{{ v }}</code></li>{% endfor %}</ul>
+        {% else %}<i class="muted">always matches</i>{% endif %}</td>
+    <td><ul class="tree top">{{ modules(r.modules) }}{{ modules(r.modules.fast or {}, "fast.") }}</ul></td>
+    <td>{% if r.auth %}<ul class="tree top">{% for k, v in r.auth.items() %}<li><span class="k-{{ k }}">{{ k }}</span>
+          {%- if v is string %} {{ v }}{% elif v is none %} <span class="muted">none</span>{% else %}{{ mlist(v) }}{% endif %}</li>{% endfor %}</ul>
+        {% else %}–{% endif %}</td>
+    <td>{% set ok = handlers(r.on_success) %}{% set fail = handlers(r.on_fail) %}
+        {%- if ok or fail %}<ul class="tree top">{% if ok %}<li>ok<ul class="tree">{{ ok }}</ul></li>{% endif %}{% if fail %}<li>fail<ul class="tree">{{ fail }}</ul></li>{% endif %}</ul>
+        {%- else %}–{% endif %}</td></tr>
+  {% else %}
+  <tr><td colspan="5" class="muted">no rules defined</td></tr>
+  {% endfor %}
+</table>
+
+</body>
+</html>

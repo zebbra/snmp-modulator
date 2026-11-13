@@ -5,43 +5,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>snmp-modulator</title>
-<style>
-  :root { --bg: #0C0D10; --fg: #cfe8df; --muted: #888; --line: #1a1d24; --head: #5DCAA5; --link: #9FE1CB;
-          --ok: #1D9E75; --warn: #B8722B; --bad: #e74c3c; }
-  body { font-family: monospace; max-width: 1000px; margin: 1.5em auto; padding: 0 1em; background: var(--bg); color: var(--fg); }
-  h1 { color: var(--head); margin-bottom: .2em; display: flex; align-items: center; gap: .6em; flex-wrap: wrap; }
-  h1 small { color: var(--muted); font-size: .5em; }
-  h2 { color: var(--link); border-bottom: 1px solid #2a2e38; padding-bottom: .3em; margin-top: 1.6em; }
-  h2 small { font-size: .6em; font-weight: normal; }
-  a { color: var(--head); }
-  code { color: var(--link); }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { text-align: left; padding: .35em .7em; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { color: var(--head); }
-  .muted { color: var(--muted); }
-  .badge { display: inline-block; padding: .1em .6em; border-radius: 4px; font-weight: bold; color: #fff; }
-  .s-ok, .s-done, .s-running, .s-live { color: #2ecc71; }
-  .s-skipped, .s-queued, .s-cancelled, .s-interrupted, .s-unreachable { color: #fdcb6e; }
-  .s-error, .s-failed { color: var(--bad); }
-  .bg-ok { background: var(--ok); } .bg-warn { background: var(--warn); } .bg-bad { background: var(--bad); }
-  .btn { display: inline-block; padding: .1em .6em; border: 1px solid var(--head); border-radius: 4px; background: none;
-         color: var(--head); font: inherit; cursor: pointer; text-decoration: none; }
-  .btn:hover { background: var(--head); color: var(--bg); }
-  .btn.danger { border-color: var(--bad); color: var(--bad); } .btn.danger:hover { background: var(--bad); color: #fff; }
-  form.act { display: inline; margin: 0; }
-  h1 .badge { font-size: .5em; }
-  input, select { font: inherit; background: #15171d; color: var(--fg); border: 1px solid #2a2e38; border-radius: 4px; padding: .1em .4em; }
-  input[type=text] { width: 11em; } input.wide { width: 18em; }
-  .status span { margin-right: 1.4em; white-space: nowrap; line-height: 1.8; }
-  .actions td:first-child { white-space: nowrap; color: var(--head); }
-  .nowrap { white-space: nowrap; }
-  #result { display: none; margin: 1em 0; padding: .6em .8em; border: 1px solid #2a2e38; border-radius: 4px; white-space: pre-wrap;
-            max-height: 18em; overflow: auto; }
-  #result.ok { border-color: var(--ok); } #result.bad { border-color: var(--bad); }
-  details { margin: .5em 0; } summary { cursor: pointer; }
-  footer { margin: 2.5em 0 1em; color: var(--muted); }
-  @media (max-width: 640px) { th, td { padding: .3em .4em; } .hide-narrow { display: none; } }
-</style>
+{% include "_style.html" %}
 </head>
 <body>
 

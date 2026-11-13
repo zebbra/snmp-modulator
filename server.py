@@ -44,7 +44,6 @@ for real — no re-probing. One-shot: the cache entry is consumed on that commit
 """
 
 import asyncio
-import html
 import json
 import logging
 import os
@@ -1484,85 +1483,7 @@ async def probe_run_cancel() -> dict:
 
 def _rules_html(snap: dict) -> str:
     """Render a MappingEngine.snapshot() dict as a dashboard-styled HTML page."""
-    esc = lambda s: html.escape(str(s))  # noqa: E731
-
-    def modules_str(mods: dict) -> str:
-        parts = [
-            f'<span style="color:{color}">{key}</span>: {esc(", ".join(vals))}'
-            for key, color in (("add", "#1D9E75"), ("try", "#9FE1CB"), ("block", "#B8722B"))
-            if (vals := mods.get(key))
-        ]
-        if mods.get("interval") or mods.get("timeout"):
-            interval, timeout = esc(mods.get("interval") or "-"), esc(mods.get("timeout") or "-")
-            parts.append(f"floor: interval={interval} timeout={timeout}")
-        fast = mods.get("fast") or {}
-        fast_parts = [
-            f'<span style="color:{color}">fast.{key}</span>: {esc(", ".join(vals))}'
-            for key, color in (("add", "#1D9E75"), ("try", "#9FE1CB"), ("block", "#B8722B"))
-            if (vals := fast.get(key))
-        ]
-        if fast.get("interval") or fast.get("timeout"):
-            interval, timeout = esc(fast.get("interval") or "-"), esc(fast.get("timeout") or "-")
-            fast_parts.append(f"fast floor: interval={interval} timeout={timeout}")
-        parts.extend(fast_parts)
-        return "<br>".join(parts) or "-"
-
-    def match_str(match: dict) -> str:
-        if not match:
-            return "<i>(always matches)</i>"
-        return "<br>".join(f"<code>{esc(k)}</code> ~ <code>{esc(v)}</code>" for k, v in match.items())
-
-    def handlers_str(h: dict) -> str:
-        parts = [f"{label}: {esc(', '.join(h[key]))}" for key, label in
-                 (("add_tag", "+tag"), ("remove_tag", "-tag"), ("notify", "notify")) if h.get(key)]
-        return "<br>".join(parts) or "-"
-
-    rule_rows = "".join(
-        f"<tr><td>{esc(rule['name'])}</td>"
-        f"<td>{match_str(rule['match'])}</td>"
-        f"<td>{modules_str(rule['modules'])}</td>"
-        f"<td>{esc(rule['auth']) if rule['auth'] else '-'}</td>"
-        f"<td>ok: {handlers_str(rule['on_success'])}<br>fail: {handlers_str(rule['on_fail'])}</td></tr>"
-        for rule in snap["rules"]
-    ) or "<tr><td colspan=5>no rules defined</td></tr>"
-
-    return f"""<!doctype html><html><head><meta charset=utf-8>
-<title>snmp-modulator rules</title>
-<style>{_DASHBOARD_CSS}</style></head><body>
-<h1>snmp-modulator <small style="color:#888;font-size:.5em">v{__version__}</small> — rules</h1>
-<p><a href="/">&larr; dashboard</a> &nbsp; <a href="/rules">raw json</a></p>
-
-<h2>Config</h2>
-<table>
-  <tr><td>module_field / auth_field</td>
-      <td>{esc(snap['module_field'])} / {esc(snap['auth_field'])}</td></tr>
-  <tr><td>interval_field / timeout_field</td>
-      <td>{esc(snap['interval_field'] or '-')} / {esc(snap['timeout_field'] or '-')}</td></tr>
-  <tr><td>touch_field</td><td>{esc(snap['touch_field'] or '-')}</td></tr>
-  <tr><td>default_interval / default_timeout</td>
-      <td>{esc(snap['default_interval'])} / {esc(snap['default_timeout'])}</td></tr>
-  <tr><td>fast_module_field</td><td>{esc(snap['fast_module_field'] or '-')}</td></tr>
-  <tr><td>fast_interval_field / fast_timeout_field</td>
-      <td>{esc(snap['fast_interval_field'] or '-')} / {esc(snap['fast_timeout_field'] or '-')}</td></tr>
-  <tr><td>fast_default_interval / fast_default_timeout</td>
-      <td>{esc(snap['fast_default_interval'])} / {esc(snap['fast_default_timeout'])}</td></tr>
-  <tr><td>module_policy / auth_policy</td>
-      <td>{esc(snap['module_policy'])} / {esc(snap['auth_policy'])}</td></tr>
-  <tr><td>auth_probe_module</td><td>{esc(snap['auth_probe_module'])}</td></tr>
-</table>
-
-<h2>Defaults</h2>
-<table>
-  <tr><td>modules</td><td>{modules_str(snap['defaults']['modules'])}</td></tr>
-  <tr><td>auth try</td><td>{esc(", ".join(snap['defaults']['auth']['try']) or '-')}</td></tr>
-</table>
-
-<h2>Rules ({len(snap['rules'])})</h2>
-<table>
-  <tr><th>Name</th><th>Match</th><th>Modules</th><th>Auth override</th><th>Handlers</th></tr>
-  {rule_rows}
-</table>
-</body></html>"""
+    return _templates.get_template("rules.html").render(s=snap, version=__version__, mapping_file=_MAPPING_FILE)
 
 
 @app.get(
@@ -1613,22 +1534,6 @@ def _start_device_count_refresher() -> None:
 
 # Shared by index() and /rules?format=html — palette matches banner.svg
 # (teal-green on near-black), kept distinct from bit-discobox's purple/blue theme.
-_DASHBOARD_CSS = """
-  body { font-family: monospace; max-width: 860px; margin: 2em auto; padding: 0 1em;
-          background: #0C0D10; color: #cfe8df; }
-  h1 { color: #5DCAA5; }
-  h2 { color: #9FE1CB; border-bottom: 1px solid #1a1d24; padding-bottom: .3em; }
-  .badge { display:inline-block; padding: .2em .7em; border-radius: 4px; font-weight: bold; color: #fff; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { text-align: left; padding: .4em .8em; border-bottom: 1px solid #1a1d24; vertical-align: top; }
-  th { color: #5DCAA5; }
-  .endpoints td:first-child { color: #5DCAA5; }
-  .endpoints td:nth-child(2) { color: #9FE1CB; }
-  a { color: #5DCAA5; }
-  code { color: #9FE1CB; }
-"""
-
-
 _templates = Jinja2Templates(directory=os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates"))
 _templates.env.filters["ts"] = lambda t: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)) if t else ""
 _templates.env.filters["qs"] = lambda f: "&".join(
