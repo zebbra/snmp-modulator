@@ -84,7 +84,10 @@ if int(os.getenv("MODULATOR_WORKERS", "4")) > 1 and not os.environ.get("PROMETHE
 
 import uvicorn
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     CollectorRegistry,
@@ -356,7 +359,25 @@ app = FastAPI(
     description="Probe NetBox devices against snmp-exporter and update snmp_exporter_module",
     version=__version__,
     lifespan=_lifespan,
+    docs_url=None,      # served below from local assets
+    redoc_url=None,
 )
+
+# Swagger UI assets baked into the image (Dockerfile), so /docs works without
+# internet access; a checkout without them falls back to FastAPI's CDN copy.
+_SWAGGER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "swagger")
+if os.path.isfile(os.path.join(_SWAGGER_DIR, "swagger-ui-bundle.js")):
+    app.mount("/static/swagger", StaticFiles(directory=_SWAGGER_DIR), name="swagger")
+    _SWAGGER_ASSETS = {"swagger_js_url": "/static/swagger/swagger-ui-bundle.js",
+                       "swagger_css_url": "/static/swagger/swagger-ui.css",
+                       "swagger_favicon_url": "/static/swagger/favicon-32x32.png"}
+else:
+    _SWAGGER_ASSETS = {}
+
+
+@app.get("/docs", include_in_schema=False)
+async def swagger_ui() -> HTMLResponse:
+    return get_swagger_ui_html(openapi_url=app.openapi_url, title="snmp-modulator API", **_SWAGGER_ASSETS)
 
 # Active probe job keys — prevents duplicate concurrent probes for the same target
 _in_flight: set = set()
@@ -1608,97 +1629,40 @@ _DASHBOARD_CSS = """
 """
 
 
+_templates = Jinja2Templates(directory=os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates"))
+_templates.env.filters["ts"] = lambda t: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)) if t else ""
+_templates.env.filters["qs"] = lambda f: "&".join(
+    f"{k}={x}" for k, v in (f or {}).items() for x in (v if isinstance(v, list) else [v])
+)
+
+
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def index() -> str:
+def index(request: Request) -> HTMLResponse:
     with _in_flight_lock:
         in_flight = sorted(_in_flight)
-
-    by_auth   = sorted(_devices_by_label("modulator_netbox_devices_by_auth", "profile").items())
-    by_module = sorted(_devices_by_label("modulator_netbox_devices_by_module", "module").items())
-
-    _no_data = "<tr><td colspan=2>no data yet</td></tr>"
-    auth_rows = "".join(f"<tr><td>{p}</td><td>{n}</td></tr>" for p, n in by_auth) or _no_data
-    module_rows = "".join(f"<tr><td>{m}</td><td>{n}</td></tr>" for m, n in by_module) or _no_data
-    inflight_rows = "".join(f"<tr><td>{k}</td></tr>" for k in in_flight) or "<tr><td>none</td></tr>"
-
-    mode_badge = (
-        '<span class="badge" style="background:#B8722B">DRY RUN</span>'
-        if _DRY_RUN else '<span class="badge" style="background:#1D9E75">live</span>'
-    )
-    refresh_str = f"{_NETBOX_REFRESH_INTERVAL}s" if _NETBOX_REFRESH_INTERVAL > 0 else "disabled"
-
-    mismatch = _module_mismatch_snapshot()
-    if mismatch["netbox_only"] or mismatch["snmp_exporter_only"]:
-        mismatch_badge = '<span class="badge" style="background:#B8722B">mismatch</span>'
-        mismatch_rows = (
-            f"<tr><td>In NetBox, not in snmp-exporter</td><td>{', '.join(mismatch['netbox_only']) or '-'}</td></tr>"
-            f"<tr><td>In snmp-exporter, not in NetBox</td>"
-            f"<td>{', '.join(mismatch['snmp_exporter_only']) or '-'}</td></tr>"
-        )
-    else:
-        mismatch_badge = '<span class="badge" style="background:#1D9E75">in sync</span>'
-        mismatch_rows = ""
-
-    return f"""<!doctype html><html><head><meta charset=utf-8>
-<title>snmp-modulator</title>
-<style>{_DASHBOARD_CSS}</style></head><body>
-<h1>snmp-modulator <small style="color:#888;font-size:.5em">v{__version__}</small></h1>
-<p>Mode: {mode_badge}
-&nbsp; Running: <b>{int(_metric_value("modulator_probe_running"))}</b>
-&nbsp; Queued: <b>{int(_metric_value("modulator_probe_queued"))}</b>
-&nbsp; Waiting for a slot: <b>{int(_metric_value("modulator_probe_queue_depth"))}</b>
-&nbsp; Max concurrent: <b>{_MAX_CONCURRENT}</b> per worker
-(<b>{_MAX_CONCURRENT * _WORKERS}</b> pod-wide across {_WORKERS} workers)
-&nbsp; Device parallelism: <b>{_DEVICE_PARALLELISM}</b>
-&nbsp; NetBox refresh: <b>{refresh_str}</b></p>
-
-<h2>Endpoints</h2>
-<table class="endpoints">
-  <tr><th>Method</th><th>Path</th><th>Description</th></tr>
-  <tr><td>GET/POST</td><td>/probe</td><td>Probe a single device by IP or name</td></tr>
-  <tr><td>GET/POST</td><td>/probe/netbox</td><td>Probe devices matching a NetBox filter</td></tr>
-  <tr><td>POST/GET/DELETE</td><td>/probe/run</td><td>Bulk probe, dry run, per-device results (max {_RUN_MAX_DEVICES});
-    GET for progress, DELETE to cancel</td></tr>
-  <tr><td>GET/POST</td><td>/modules/add</td><td>Add module(s) on devices matching a NetBox filter — no probing</td></tr>
-  <tr><td>GET/POST</td><td>/modules/remove</td><td>Remove module(s) — no probing</td></tr>
-  <tr><td>GET/POST</td><td>/modules/replace</td><td>Replace module(s) with others — no probing</td></tr>
-  <tr><td>GET</td><td>/modules/result</td>
-      <td>Poll a <code>/modules/*</code> job (<code>?job=&lt;id&gt;</code>)</td></tr>
-  <tr><td>GET</td><td><a href=/rules?format=html>/rules</a></td>
-      <td>Loaded mapping.yaml rules (JSON by default; link goes to <code>?format=html</code>)</td></tr>
-  <tr><td>GET</td><td><a href=/stats>/stats</a></td>
-      <td>Device counts by auth/module + module mismatch, as JSON</td></tr>
-  <tr><td>GET</td><td><a href={_METRICS_PATH}>{_METRICS_PATH}</a></td><td>Prometheus metrics</td></tr>
-  <tr><td>GET</td><td><a href=/health>/health</a></td><td>Liveness check</td></tr>
-  <tr><td>GET</td><td><a href=/docs>/docs</a></td><td>Swagger UI</td></tr>
-</table>
-<p>Examples (POST recommended; GET also triggers the probe, so these aren't links):</p>
-<ul>
-  <li><code>/probe?host=10.0.0.5</code></li>
-  <li><code>/probe?host=switch1.nms.admin.ch</code></li>
-  <li><code>/probe?host=10.0.0.5&amp;wait=true&amp;dry_run=true</code> — blocks and returns the result as JSON</li>
-  <li><code>/probe?host=10.0.0.5&amp;wait=true</code> — a plain follow-up call within
-      {int(_DRY_RUN_CACHE_TTL)}s commits the dry run above for real, without re-probing</li>
-  <li><code>/probe/netbox?role_id=4&amp;last_updated__lt=2025-10-01</code></li>
-  <li><code>/probe/netbox?site=dc1&amp;tag=snmp-ready</code></li>
-  <li><code>/probe/netbox?manufacturer=cisco</code></li>
-  <li><code>/modules/add?module=if_updown_state&amp;cf_snmp_exporter_module=if_full</code></li>
-  <li><code>/modules/remove?module=cisco-generic</code></li>
-  <li><code>/modules/replace?old=if_status,if_error,if_traffic&amp;new=if_full</code></li>
-</ul>
-
-<h2>Module mismatch {mismatch_badge}</h2>
-<table>{mismatch_rows or "<tr><td>NetBox module choices and snmp-exporter modules match</td></tr>"}</table>
-
-<h2>In-flight jobs ({len(in_flight)})</h2>
-<table>{inflight_rows}</table>
-
-<h2>Devices by auth profile</h2>
-<table><tr><th>Profile</th><th>Count</th></tr>{auth_rows}</table>
-
-<h2>Devices by module</h2>
-<table><tr><th>Module</th><th>Count</th></tr>{module_rows}</table>
-</body></html>"""
+    _prune_edit_jobs()
+    return _templates.TemplateResponse(request, "index.html", {
+        "version": __version__,
+        "dry_run": _DRY_RUN,
+        "probe": {
+            "running": int(_metric_value("modulator_probe_running")),
+            "queued":  int(_metric_value("modulator_probe_queued")),
+            "waiting": int(_metric_value("modulator_probe_queue_depth")),
+        },
+        "max_concurrent": _MAX_CONCURRENT,
+        "workers": _WORKERS,
+        "device_parallelism": _DEVICE_PARALLELISM,
+        "refresh": f"{_NETBOX_REFRESH_INTERVAL}s" if _NETBOX_REFRESH_INTERVAL > 0 else "disabled",
+        "liveness": bool(_LIVENESS_URL),
+        "mismatch": _module_mismatch_snapshot(),
+        "run": _probe_run_snapshot(),
+        "run_cache_ttl": int(_RUN_CACHE_TTL // 60),
+        "jobs": _list_edit_jobs(),
+        "in_flight": in_flight,
+        "by_auth": sorted(_devices_by_label("modulator_netbox_devices_by_auth", "profile").items()),
+        "by_module": sorted(_devices_by_label("modulator_netbox_devices_by_module", "module").items()),
+        "metrics_path": _METRICS_PATH,
+    })
 
 
 @app.get(

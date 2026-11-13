@@ -491,9 +491,10 @@ Options:
 | `GET/POST /modules/remove?module=<m>[&<filter>]` | Remove module(s) — no probing |
 | `GET/POST /modules/replace?old=<m>&new=<m>[&<filter>]` | Replace module(s) — no probing |
 | `GET /modules/result[?job=<id>]` | Poll a `/modules/*` job; without `job`, list all jobs |
+| `GET /` | Admin page: status, bulk probe, module edits, actions |
 | `GET /health` | Liveness check |
 | `GET /metrics` | Prometheus metrics |
-| `GET /docs` | Swagger UI |
+| `GET /docs` | Swagger UI (assets baked into the image, no CDN) |
 
 NetBox filter params are passed directly to `dcim.devices.filter()`:
 

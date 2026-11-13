@@ -1,0 +1,226 @@
+{%- macro mods(list) -%}{{ list|join(", ") if list else "–" }}{%- endmacro -%}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>snmp-modulator</title>
+<style>
+  :root { --bg: #0C0D10; --fg: #cfe8df; --muted: #888; --line: #1a1d24; --head: #5DCAA5; --link: #9FE1CB;
+          --ok: #1D9E75; --warn: #B8722B; --bad: #e74c3c; }
+  body { font-family: monospace; max-width: 1000px; margin: 1.5em auto; padding: 0 1em; background: var(--bg); color: var(--fg); }
+  h1 { color: var(--head); margin-bottom: .2em; display: flex; align-items: center; gap: .6em; flex-wrap: wrap; }
+  h1 small { color: var(--muted); font-size: .5em; }
+  h2 { color: var(--link); border-bottom: 1px solid #2a2e38; padding-bottom: .3em; margin-top: 1.6em; }
+  h2 small { font-size: .6em; font-weight: normal; }
+  a { color: var(--head); }
+  code { color: var(--link); }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: .35em .7em; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--head); }
+  .muted { color: var(--muted); }
+  .badge { display: inline-block; padding: .1em .6em; border-radius: 4px; font-weight: bold; color: #fff; }
+  .s-ok, .s-done, .s-running, .s-live { color: #2ecc71; }
+  .s-skipped, .s-queued, .s-cancelled, .s-interrupted, .s-unreachable { color: #fdcb6e; }
+  .s-error, .s-failed { color: var(--bad); }
+  .bg-ok { background: var(--ok); } .bg-warn { background: var(--warn); } .bg-bad { background: var(--bad); }
+  .btn { display: inline-block; padding: .1em .6em; border: 1px solid var(--head); border-radius: 4px; background: none;
+         color: var(--head); font: inherit; cursor: pointer; text-decoration: none; }
+  .btn:hover { background: var(--head); color: var(--bg); }
+  .btn.danger { border-color: var(--bad); color: var(--bad); } .btn.danger:hover { background: var(--bad); color: #fff; }
+  form.act { display: inline; margin: 0; }
+  h1 .badge { font-size: .5em; }
+  input, select { font: inherit; background: #15171d; color: var(--fg); border: 1px solid #2a2e38; border-radius: 4px; padding: .1em .4em; }
+  input[type=text] { width: 11em; } input.wide { width: 18em; }
+  .status span { margin-right: 1.4em; white-space: nowrap; line-height: 1.8; }
+  .actions td:first-child { white-space: nowrap; color: var(--head); }
+  .nowrap { white-space: nowrap; }
+  #result { display: none; margin: 1em 0; padding: .6em .8em; border: 1px solid #2a2e38; border-radius: 4px; white-space: pre-wrap;
+            max-height: 18em; overflow: auto; }
+  #result.ok { border-color: var(--ok); } #result.bad { border-color: var(--bad); }
+  details { margin: .5em 0; } summary { cursor: pointer; }
+  footer { margin: 2.5em 0 1em; color: var(--muted); }
+  @media (max-width: 640px) { th, td { padding: .3em .4em; } .hide-narrow { display: none; } }
+</style>
+</head>
+<body>
+
+<h1>snmp-modulator <small>v{{ version }}</small>
+  {% if dry_run %}<span class="badge bg-warn">DRY RUN</span>{% else %}<span class="badge bg-ok">live</span>{% endif %}
+</h1>
+
+<div class="status" id="live-status">
+  <span>running <b>{{ probe.running }}</b></span>
+  <span>queued <b>{{ probe.queued }}</b></span>
+  <span>waiting for a slot <b>{{ probe.waiting }}</b></span>
+  <span>max concurrent <b>{{ max_concurrent }}</b> per worker (<b>{{ max_concurrent * workers }}</b> pod-wide across {{ workers }} workers)</span>
+  <span>device parallelism <b>{{ device_parallelism }}</b></span>
+  <span>NetBox refresh <b>{{ refresh }}</b></span>
+  <span>liveness {% if liveness %}<b class="s-ok">on</b>{% else %}<span class="muted">disabled</span>{% endif %}</span>
+  <span>module sets {% if mismatch.netbox_only or mismatch.snmp_exporter_only %}<b class="s-skipped">mismatch</b>{% else %}<b class="s-ok">in sync</b>{% endif %}</span>
+</div>
+
+<div id="result"></div>
+
+<h2>Bulk probe <small class="muted">/probe/run · <a href="/probe/run">JSON</a></small></h2>
+<div id="live-run">
+{% if run.status == "none" %}<p class="muted">no run yet (max {{ run.max_devices }} devices per run)</p>
+{% else %}
+<p><span class="s-{{ run.status }}">{{ run.status }}</span>{% if run.dry_run %} <span class="muted">[dry-run]</span>{% endif %}
+  · started {{ run.started }}{% if run.finished %} · finished {{ run.finished }}{% endif %}
+  · {{ run.done }}/{{ run.total }} done
+  {%- for k in ["ok", "changed", "skipped", "unreachable", "error", "cancelled"] if run[k] %} · {{ k }} <b>{{ run[k] }}</b>{% endfor %}
+  {%- if run.avg_duration_s %} · avg {{ run.avg_duration_s }}s{% endif %}
+  {% if run.status == "running" %}<form class="act" method="post" action="/probe/run" data-method="DELETE" data-confirm="Cancel the devices not started yet?"> <button class="btn danger">cancel</button></form>{% endif %}
+  <br><span class="muted">filter</span> <code>{{ run.netbox_filter|qs }}</code></p>
+<table>
+  <tr><th>Device</th><th>Status</th><th>Modules</th><th class="hide-narrow">Auth</th><th class="hide-narrow">Time</th></tr>
+  {% for d in run.devices %}
+  <tr><td class="nowrap">{{ d.device_name }} <span class="muted">{{ d.host }}</span></td>
+    <td><span class="s-{{ d.status }}">{{ d.status }}</span>{% if d.changed %} <b>changed</b>{% endif %}
+      {%- if d.reason %} <span class="muted">{{ d.reason }}</span>{% endif %}
+      {%- if d.source == "cache" %} <span class="muted">(cache)</span>{% endif %}</td>
+    <td>{% if d.final_modules is not none and d.final_modules != d.previous_modules %}{{ mods(d.previous_modules) }} → <b>{{ mods(d.final_modules) }}</b>
+        {% else %}{{ mods(d.previous_modules) }}{% endif %}</td>
+    <td class="hide-narrow">{% if d.auth_profile_new and d.auth_profile_new != d.auth_profile_old %}{{ d.auth_profile_old or "–" }} → <b>{{ d.auth_profile_new }}</b>{% else %}{{ d.auth_profile_old or "–" }}{% endif %}</td>
+    <td class="hide-narrow">{% if d.duration_s is not none %}{{ d.duration_s }}s{% endif %}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+</div>
+
+<h2>Module edits <small class="muted">/modules/add|remove|replace · <a href="/modules/result">JSON</a></small></h2>
+<div id="live-jobs">
+{% if jobs %}
+<table>
+  <tr><th>Started</th><th>Edit</th><th class="hide-narrow">Filter</th><th>Result</th></tr>
+  {% for j in jobs %}
+  <tr><td class="nowrap">{{ j.started|ts }}</td>
+    <td>{{ j.op }} {% if j.remove %}<span class="muted">−</span>{{ j.remove|join(",") }} {% endif %}{% if j.add %}<span class="muted">+</span>{{ j.add|join(",") }}{% endif %}
+      {%- if j.profile != "normal" %} <span class="muted">({{ j.profile }})</span>{% endif %}{% if j.dry_run %} <span class="muted">[dry-run]</span>{% endif %}</td>
+    <td class="hide-narrow"><code>{{ j.filter|qs }}</code></td>
+    <td><a class="s-{{ j.status }}" href="{{ j.result_url }}">{{ j.status }}</a>
+      {%- if j.summary %} <span class="muted">matched {{ j.summary.matched }}, changed {{ j.summary.changed }}
+      {%- if j.summary.pinned %}, pinned {{ j.summary.pinned }}{% endif %}{% if j.summary.errors %}, errors {{ j.summary.errors }}{% endif %}</span>{% endif %}
+      {%- if j.error %} {{ j.error }}{% endif %}</td></tr>
+  {% endfor %}
+</table>
+{% else %}<p class="muted">none</p>{% endif %}
+</div>
+
+<h2>Actions</h2>
+<table class="actions">
+  <tr><td>probe device</td><td>
+    <form class="act" method="post" action="/probe"><input type="text" name="host" placeholder="IP or NetBox name" required>
+      <select name="dry_run"><option value="true">dry-run</option><option value="false">apply</option></select>
+      <input type="hidden" name="wait" value="true">
+      <button class="btn">probe</button></form>
+    <span class="muted">waits for the result; an apply right after a dry run commits it without probing again</span></td></tr>
+  <tr><td>bulk probe</td><td>
+    <form class="act" method="post" action="/probe/run"><input type="text" class="wide" name="filter" placeholder="site=dc1&amp;role=switch or id=1&amp;id=2" required>
+      <select name="dry_run"><option value="true">dry-run</option><option value="false">apply</option></select>
+      limit <input type="text" name="limit" placeholder="{{ run.max_devices }}" style="width:4em">
+      <button class="btn">start</button></form>
+    <span class="muted">one device after the other, max {{ run.max_devices }}; an apply within {{ run_cache_ttl }} min commits the dry run without probing again</span></td></tr>
+  <tr><td>add module</td><td>
+    <form class="act" method="post" action="/modules/add"><input type="text" name="module" placeholder="module[,module]" required>
+      <input type="text" class="wide" name="filter" placeholder="cf_snmp_exporter_module=if_full" required>
+      <button class="btn danger">add</button></form></td></tr>
+  <tr><td>remove module</td><td>
+    <form class="act" method="post" action="/modules/remove" data-confirm-empty="filter" data-confirm="No filter: remove from every device carrying it?">
+      <input type="text" name="module" placeholder="module[,module]" required>
+      <input type="text" class="wide" name="filter" placeholder="optional NetBox filter">
+      <button class="btn danger">remove</button></form></td></tr>
+  <tr><td>replace module</td><td>
+    <form class="act" method="post" action="/modules/replace" data-confirm-empty="filter" data-confirm="No filter: replace on every device carrying it?">
+      <input type="text" name="old" placeholder="old[,old]" required> → <input type="text" name="new" placeholder="new[,new]" required>
+      <input type="text" class="wide" name="filter" placeholder="optional NetBox filter">
+      <button class="btn danger">replace</button></form>
+    <span class="muted">module edits write NetBox directly, no probing{% if dry_run %} (server in dry-run: nothing is written){% endif %}</span></td></tr>
+</table>
+
+<h2>Module sets</h2>
+{% if mismatch.netbox_only or mismatch.snmp_exporter_only %}
+<table>
+  <tr><td>In NetBox, not in snmp-exporter</td><td>{{ mods(mismatch.netbox_only) }}</td></tr>
+  <tr><td>In snmp-exporter, not in NetBox</td><td>{{ mods(mismatch.snmp_exporter_only) }}</td></tr>
+</table>
+{% else %}<p class="muted">NetBox module choices and snmp-exporter modules match (in sync)</p>{% endif %}
+
+<details{% if in_flight %} open{% endif %}><summary>In-flight probes: <b>{{ in_flight|length }}</b></summary>
+  {% if in_flight %}<table>{% for k in in_flight %}<tr><td>{{ k }}</td></tr>{% endfor %}</table>{% else %}<p class="muted">none</p>{% endif %}
+</details>
+<details><summary>Devices by auth profile: <b>{{ by_auth|length }}</b> · <a href="/stats">JSON</a></summary>
+  {% if by_auth %}<table><tr><th>Profile</th><th>Count</th></tr>{% for p, n in by_auth %}<tr><td>{{ p }}</td><td>{{ n|int }}</td></tr>{% endfor %}</table>
+  {% else %}<p class="muted">no data yet</p>{% endif %}
+</details>
+<details><summary>Devices by module: <b>{{ by_module|length }}</b> · <a href="/stats">JSON</a></summary>
+  {% if by_module %}<table><tr><th>Module</th><th>Count</th></tr>{% for m, n in by_module %}<tr><td>{{ m }}</td><td>{{ n|int }}</td></tr>{% endfor %}</table>
+  {% else %}<p class="muted">no data yet</p>{% endif %}
+</details>
+
+<footer>
+  <a href="/docs">API docs</a> · <a href="/rules?format=html">/rules</a> · <a href="/stats">/stats</a> · <a href="{{ metrics_path }}">{{ metrics_path }}</a> · <a href="/health">/health</a>
+</footer>
+
+<script>
+// Every action calls the API endpoint with the form's fields as query params
+// (a "filter" field is a raw NetBox filter query string); the answer is shown
+// above the bulk probe after a reload. Without JS the form posts directly and
+// the browser shows the JSON answer.
+const box = document.getElementById("result");
+function show(text, ok) { box.textContent = text; box.className = ok ? "ok" : "bad"; box.style.display = "block"; }
+try {
+  const saved = JSON.parse(sessionStorage.getItem("modulator-result") || "null");
+  if (saved) { show(saved.text, saved.ok); sessionStorage.removeItem("modulator-result"); }
+} catch (e) {}
+function bind(form) { form.addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const params = new URLSearchParams();
+  for (const [k, v] of new FormData(form)) {
+    if (v === "") continue;
+    if (k === "filter") for (const [fk, fv] of new URLSearchParams(v.trim())) params.append(fk, fv);
+    else params.append(k, v);
+  }
+  const empty = form.dataset.confirmEmpty;
+  const emptyNow = empty === "filter" ? !(form.elements.filter?.value.trim()) : !params.get(empty);
+  if (form.dataset.confirm && (!empty || emptyNow) && !confirm(form.dataset.confirm)) return;
+  const method = form.dataset.method || "POST";
+  const url = form.getAttribute("action") + (params.toString() ? "?" + params : "");
+  show(`${method} ${url} …`, true);
+  let text, ok;
+  try {
+    const r = await fetch(url, { method });
+    const body = await r.text();
+    try { text = JSON.stringify(JSON.parse(body), null, 2); } catch (e) { text = body; }
+    text = `${method} ${url} → ${r.status}\n${text}`; ok = r.ok;
+  } catch (e) { text = `${method} ${url} failed: ${e}`; ok = false; }
+  try { sessionStorage.setItem("modulator-result", JSON.stringify({ text, ok })); location.reload(); }
+  catch (e) { show(text, ok); }
+}); }
+document.querySelectorAll("form.act").forEach(bind);
+
+// Lazy auto-refresh: swap in the status line, bulk probe and module edits from a
+// fresh copy of this page, every 5s while a bulk probe runs, else every 30s; not
+// while the tab is hidden or a field has focus.
+const LIVE = ["live-status", "live-run", "live-jobs"];
+async function refresh() {
+  if (!document.hidden && !document.activeElement?.matches("input, select")) {
+    try {
+      const r = await fetch("/", { cache: "no-store" });
+      if (r.ok) {
+        const fresh = new DOMParser().parseFromString(await r.text(), "text/html");
+        for (const id of LIVE) {
+          const el = document.getElementById(id), next = fresh.getElementById(id);
+          if (el && next) el.innerHTML = next.innerHTML;
+        }
+        document.querySelectorAll("#live-run form.act").forEach(bind);
+      }
+    } catch (e) {}
+  }
+  setTimeout(refresh, document.querySelector("#live-run .s-running") ? 5000 : 30000);
+}
+setTimeout(refresh, document.querySelector("#live-run .s-running") ? 5000 : 30000);
+</script>
+</body>
+</html>

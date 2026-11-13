@@ -45,6 +45,13 @@ def test_server_imports_twice_without_registry_collision() -> None:
 
 import server  # noqa: E402
 
+
+def _index_html() -> str:
+    from starlette.requests import Request
+    req = Request({"type": "http", "method": "GET", "path": "/", "query_string": b"", "headers": []})
+    return server.index(req).body.decode()
+
+
 # ── filter key validation ───────────────────────────────────────────────────────
 
 def test_valid_filter_key_accepts_alnum_and_operator_suffix() -> None:
@@ -504,7 +511,7 @@ def test_index_lists_in_flight_jobs_and_device_counts() -> None:
     server.netbox_devices_by_module.labels(module="if_mib").set(3)
     server._in_flight.add("host:10.0.0.1")
     try:
-        html = asyncio.run(server.index())
+        html = _index_html()
     finally:
         server._in_flight.discard("host:10.0.0.1")
 
@@ -516,9 +523,8 @@ def test_index_lists_in_flight_jobs_and_device_counts() -> None:
 def test_index_shows_pod_wide_max_concurrent(monkeypatch) -> None:
     monkeypatch.setattr(server, "_MAX_CONCURRENT", 2)
     monkeypatch.setattr(server, "_WORKERS", 4)
-    html = asyncio.run(server.index())
-    assert "pod-wide across 4 workers" in html
-    assert "<b>8</b> pod-wide" in html
+    html = _index_html()
+    assert "<b>8</b> pod-wide across 4 workers" in html
 
 
 def test_index_shows_module_mismatch_when_present() -> None:
@@ -526,7 +532,7 @@ def test_index_shows_module_mismatch_when_present() -> None:
         server._module_mismatch["only_in_netbox"] = ["stale_module"]
         server._module_mismatch["only_in_snmp"]   = ["new_module"]
     try:
-        html = asyncio.run(server.index())
+        html = _index_html()
     finally:
         with server._module_mismatch_lock:
             server._module_mismatch["only_in_netbox"] = []
@@ -541,7 +547,7 @@ def test_index_shows_in_sync_when_no_mismatch() -> None:
     with server._module_mismatch_lock:
         server._module_mismatch["only_in_netbox"] = []
         server._module_mismatch["only_in_snmp"]   = []
-    html = asyncio.run(server.index())
+    html = _index_html()
     assert "in sync" in html
 
 
@@ -946,3 +952,24 @@ def test_probe_run_interrupted_when_lock_owner_is_gone(run_env) -> None:
         f.write("999999999 0")
     assert asyncio.run(server.probe_run_status())["status"] == "interrupted"
     assert _post_run("site=dc1")["status"] == "running"
+
+
+def test_index_shows_bulk_probe_run_and_module_edits(run_env, tmp_path, monkeypatch) -> None:
+    _post_run("site=dc1")
+    _work(run_env)
+    monkeypatch.setattr(server, "_EDIT_JOB_DIR", str(tmp_path / "jobs"))
+    server._write_edit_job("a" * 32, {
+        "status": "running", "job": "a" * 32, "op": "add", "started": time.time(), "profile": "normal",
+        "add": ["if_updown_state"], "remove": [], "filter": {"site": "dc1"}, "dry_run": False,
+    })
+    html = _index_html()
+    assert "if_status → <b>if_full</b>" in html and "v2 → <b>v3</b>" in html
+    assert "unreachable" in html and "pinned" in html
+    assert "add <span class=\"muted\">+</span>if_updown_state" in html
+
+
+def test_docs_served_without_cdn_when_assets_present(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(server, "_SWAGGER_ASSETS", {"swagger_js_url": "/static/swagger/swagger-ui-bundle.js",
+                                                   "swagger_css_url": "/static/swagger/swagger-ui.css"})
+    html = asyncio.run(server.swagger_ui()).body.decode()
+    assert "/static/swagger/swagger-ui-bundle.js" in html and "cdn.jsdelivr" not in html
