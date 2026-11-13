@@ -796,3 +796,153 @@ def test_modules_result_404_for_unknown_job(edit_env) -> None:
     with pytest.raises(server.HTTPException) as exc_info:
         asyncio.run(server.modules_result(job="0" * 32))
     assert exc_info.value.status_code == 404
+
+
+# ── /probe/run ───────────────────────────────────────────────────────────────
+
+class FakeRunModulator:
+    """Stands in for Modulator: one canned result per device, records commits."""
+    instances: list = []
+
+    def __init__(self, nb, snmp, engine, dry_run=False, **kwargs):
+        self.dry_run = dry_run
+        self.probed: list = []
+        self.committed: list = []
+        FakeRunModulator.instances.append(self)
+
+    def run(self, devices, callbacks=None, **kwargs):
+        from modulator import ModulationResult, ModuleTestResult
+        device = devices[0]
+        self.probed.append(device.id)
+        if device.id == 3:
+            return [ModulationResult(device.id, device.name, ["if_status"], ["if_status"], False, [],
+                                     auth_profile="v2", unreachable=True)]
+        return [ModulationResult(
+            device.id, device.name, sorted(device.current_modules), ["if_full"], True,
+            [ModuleTestResult("if_full", True, 10, 0.5)], auth_profile="v3", auth_changed=True,
+        )]
+
+    def commit(self, result, log=None):
+        self.committed.append(result.device_id)
+
+
+def _run_device(id, modules, tags=()):
+    from modulator import DeviceInfo
+    return DeviceInfo(
+        id=id, name=f"sw{id}", primary_ip=f"10.0.0.{id}", snmp_auth_profile="v2",
+        current_modules=list(modules), nb_device=SimpleNamespace(tags=[SimpleNamespace(slug=t) for t in tags]),
+    )
+
+
+@pytest.fixture
+def run_env(tmp_path, monkeypatch):
+    engine = _edit_engine(tmp_path)
+    nb = SimpleNamespace(devices=[
+        _run_device(1, ["if_status"]), _run_device(2, ["if_status"], tags=["pin-snmp"]),
+        _run_device(3, ["if_status"]), _run_device(4, ["if_status"]),
+    ])
+
+    def get_devices(**kw):
+        ids = kw.get("id")
+        ids = None if ids is None else {int(i) for i in (ids if isinstance(ids, list) else [ids])}
+        return [d for d in nb.devices if ids is None or d.id in ids]
+
+    nb.get_devices = get_devices
+    monkeypatch.setattr(server, "_make_clients", lambda: (nb, SimpleNamespace(), engine, "drop"))
+    monkeypatch.setattr(server, "_RUN_DIR", str(tmp_path / "run"))
+    monkeypatch.setattr(server, "Modulator", FakeRunModulator)
+    monkeypatch.setattr(server, "_fetch_liveness_or_none", lambda: None)
+    started: list = []
+    monkeypatch.setattr(server, "_start_run_worker", lambda run, devices: started.append((run, devices)))
+    FakeRunModulator.instances = []
+    return SimpleNamespace(nb=nb, started=started)
+
+
+def _post_run(query: str, dry_run=True, limit=None):
+    return asyncio.run(server.probe_run(_request(query), dry_run=dry_run, limit=limit))
+
+
+def _work(run_env) -> None:
+    run, devices = run_env.started.pop()
+    server._probe_run_worker(run, devices)
+
+
+def test_probe_run_requires_a_filter(run_env) -> None:
+    with pytest.raises(server.HTTPException) as exc_info:
+        _post_run("dry_run=true")
+    assert exc_info.value.status_code == 400
+
+
+def test_probe_run_status_none_before_any_run(run_env) -> None:
+    assert asyncio.run(server.probe_run_status())["status"] == "none"
+
+
+def test_probe_run_caps_and_counts_pinned(run_env) -> None:
+    resp = _post_run("site=dc1", limit=2)
+    assert resp["status"] == "running"
+    assert {k: resp[k] for k in ("selected", "queued", "over_limit", "pinned")} == \
+        {"selected": 4, "queued": 2, "over_limit": 1, "pinned": 1}
+    snap = asyncio.run(server.probe_run_status())
+    assert [(d["device_id"], d["status"]) for d in snap["devices"]] == [(1, "queued"), (2, "skipped"), (3, "queued")]
+    assert snap["devices"][1]["reason"] == "pinned"
+
+
+def test_probe_run_second_post_while_running_is_409(run_env) -> None:
+    _post_run("site=dc1")
+    with pytest.raises(server.HTTPException) as exc_info:
+        _post_run("site=dc1")
+    assert exc_info.value.status_code == 409 and exc_info.value.detail == "run active"
+
+
+def test_probe_run_dry_run_reports_per_device_results(run_env) -> None:
+    _post_run("site=dc1")
+    _work(run_env)
+    snap = asyncio.run(server.probe_run_status())
+    assert snap["status"] == "done" and snap["dry_run"] is True
+    assert {k: snap[k] for k in ("total", "done", "remaining", "ok", "skipped", "unreachable", "changed")} == \
+        {"total": 4, "done": 4, "remaining": 0, "ok": 2, "skipped": 1, "unreachable": 1, "changed": 2}
+    first = snap["devices"][0]
+    assert first["previous_modules"] == ["if_status"] and first["final_modules"] == ["if_full"]
+    assert (first["auth_profile_old"], first["auth_profile_new"]) == ("v2", "v3")
+    assert first["changed"] is True and first["source"] == "probe" and first["duration_s"] is not None
+    assert snap["devices"][2]["status"] == "unreachable"
+    # the lock is gone, a new run can start
+    assert _post_run("site=dc1")["status"] == "running"
+
+
+def test_probe_run_apply_commits_from_cache_without_probing(run_env) -> None:
+    _post_run("site=dc1")
+    _work(run_env)
+    run_env.nb.devices[3] = _run_device(4, ["if_status", "if_mib"])   # changed in NetBox since the dry run
+    _post_run("id=1&id=4", dry_run=False)
+    _work(run_env)
+    apply = FakeRunModulator.instances[-1]
+    assert apply.committed == [1] and apply.probed == [4]
+    sources = {d["device_id"]: d["source"] for d in asyncio.run(server.probe_run_status())["devices"]}
+    assert sources[1] == "cache" and sources[4] == "probe"
+
+
+def test_probe_run_cache_expires(run_env, monkeypatch) -> None:
+    _post_run("site=dc1")
+    _work(run_env)
+    monkeypatch.setattr(server, "_RUN_CACHE_TTL", -1)
+    _post_run("id=1", dry_run=False)
+    _work(run_env)
+    assert FakeRunModulator.instances[-1].probed == [1]
+
+
+def test_probe_run_cancel_drops_devices_not_started(run_env) -> None:
+    _post_run("site=dc1")
+    snap = asyncio.run(server.probe_run_cancel())
+    assert snap["status"] == "running"
+    _work(run_env)
+    snap = asyncio.run(server.probe_run_status())
+    assert snap["status"] == "cancelled" and snap["cancelled"] == 3
+
+
+def test_probe_run_interrupted_when_lock_owner_is_gone(run_env) -> None:
+    _post_run("site=dc1")
+    with open(server._run_path("run.lock"), "w") as f:
+        f.write("999999999 0")
+    assert asyncio.run(server.probe_run_status())["status"] == "interrupted"
+    assert _post_run("site=dc1")["status"] == "running"

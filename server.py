@@ -10,6 +10,9 @@ Endpoints:
   GET/POST /modules/replace?old=&new=[&<filter>]
                                              Replace module(s), no probing (async)
   GET      /modules/result?job=<id>          Poll a /modules/* job
+  POST     /probe/run?<filter>[&dry_run=false] Bulk probe with per-device results (async, max 20)
+  GET      /probe/run                        Progress and results of the bulk probe
+  DELETE   /probe/run                        Cancel the devices not started yet
   GET      /rules                            Loaded mapping.yaml rules/config as JSON
                                                (add ?format=html for a browsable page)
   GET      /stats                            Device counts by auth/module + module mismatch, as JSON
@@ -100,9 +103,11 @@ from modulator import (
     ModulationResult,
     Modulator,
     ModuleEditor,
+    ModuleTestResult,
     NetboxClient,
     SnmpExporterClient,
     __version__,
+    _is_pinned,
     compare_module_sets,
     fetch_liveness,
 )
@@ -879,13 +884,16 @@ _EDIT_RESULT_TTL: float = float(os.getenv("MODULATOR_EDIT_RESULT_TTL", "86400"))
 _EDIT_JOB_ID = re.compile(r"^[0-9a-f]{32}$")
 
 
-def _write_edit_job(job_id: str, state: dict) -> None:
-    os.makedirs(_EDIT_JOB_DIR, exist_ok=True)
-    path = os.path.join(_EDIT_JOB_DIR, f"{job_id}.json")
-    tmp = f"{path}.{os.getpid()}.tmp"
+def _write_json(path: str, data) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
     with open(tmp, "w") as f:
-        json.dump(state, f)
+        json.dump(data, f)
     os.replace(tmp, path)
+
+
+def _write_edit_job(job_id: str, state: dict) -> None:
+    _write_json(os.path.join(_EDIT_JOB_DIR, f"{job_id}.json"), state)
 
 
 def _read_edit_job(job_id: str) -> Optional[dict]:
@@ -1138,6 +1146,321 @@ async def modules_result(
     return state
 
 
+# ── Bulk probe run ────────────────────────────────────────────────────────────
+# Same behaviour as bit-discobox's /rebuild/all: one run at a time, one device
+# after the other, at most MODULATOR_RUN_MAX_DEVICES per run. The state lives
+# in files: with MODULATOR_WORKERS>1 the POST, the polls and the DELETE can each
+# land on a different worker. The worker that took the POST runs the devices.
+
+_RUN_DIR: str = os.path.join(_MULTIPROC_DIR or tempfile.gettempdir(), "modulator-probe-run")
+_RUN_MAX_DEVICES: int = int(os.getenv("MODULATOR_RUN_MAX_DEVICES", "20"))
+_RUN_CACHE_TTL: float = float(os.getenv("MODULATOR_RUN_CACHE_TTL", "1800"))
+_RUN_PARAMS = {"dry_run", "limit"}
+_RUN_FINAL = ("ok", "skipped", "unreachable", "error", "cancelled")
+
+
+def _run_path(name: str) -> str:
+    return os.path.join(_RUN_DIR, name)
+
+
+def _read_json(path: str) -> Optional[Any]:
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _proc_start(pid: int) -> Optional[str]:
+    """Start time of a process, so a pid reused after a restart doesn't look
+    like the lock owner. None where /proc doesn't exist."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def _run_lock_owner_alive() -> bool:
+    try:
+        with open(_run_path("run.lock")) as f:
+            pid_s, _, start = f.read().strip().partition(" ")
+        pid = int(pid_s)
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        return False
+    return (_proc_start(pid) or "") == start
+
+
+def _claim_run_lock() -> bool:
+    os.makedirs(_RUN_DIR, exist_ok=True)
+    for _ in range(2):
+        try:
+            fd = os.open(_run_path("run.lock"), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"{os.getpid()} {_proc_start(os.getpid()) or ''}".encode())
+            os.close(fd)
+            return True
+        except FileExistsError:
+            if _run_lock_owner_alive():
+                return False
+            try:
+                os.unlink(_run_path("run.lock"))
+            except FileNotFoundError:
+                pass
+    return False
+
+
+def _remove(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def _utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+
+
+def _run_entry(device, fast: bool) -> dict:
+    entry = {
+        "device_id": device.id, "device_name": device.name, "host": device.primary_ip,
+        "status": "queued", "changed": None, "reason": None, "source": None, "duration_s": None,
+        "previous_modules": sorted(device.current_modules), "final_modules": None,
+        "auth_profile_old": device.snmp_auth_profile or None, "auth_profile_new": None,
+    }
+    if fast:
+        entry.update(previous_modules_fast=sorted(device.current_modules_fast), final_modules_fast=None)
+    return entry
+
+
+def _run_entry_result(result: ModulationResult, source: str) -> dict:
+    if result.skipped:
+        status, reason = "skipped", result.skipped
+    elif result.error:
+        status, reason = "error", result.error
+    elif result.unreachable:
+        status, reason = "unreachable", "no module answered, existing modules kept"
+    else:
+        status, reason = "ok", None
+    changed = bool(
+        result.changed or result.changed_fast or result.auth_changed
+        or result.polling_interval or result.polling_timeout
+        or result.polling_interval_fast or result.polling_timeout_fast
+    )
+    fields = {
+        "status": status, "reason": reason, "changed": changed, "source": source,
+        "final_modules": result.final_modules, "auth_profile_new": result.auth_profile,
+    }
+    if result.fast_profile_enabled:
+        fields["final_modules_fast"] = result.final_modules_fast
+    return fields
+
+
+def _store_run_cache(device, result: ModulationResult) -> None:
+    """Keep an ok dry-run result so the apply can commit it without probing."""
+    cache = _read_json(_run_path("cache.json")) or {}
+    cutoff = time.time() - _RUN_CACHE_TTL
+    cache = {k: v for k, v in cache.items() if v["ts"] >= cutoff}
+    cache[str(device.id)] = {"ts": time.time(), "auth_old": device.snmp_auth_profile, "result": asdict(result)}
+    _write_json(_run_path("cache.json"), cache)
+
+
+def _pop_run_cache(device) -> Optional[ModulationResult]:
+    """The cached dry-run result for this device, if it is fresh and NetBox
+    still holds what the dry run saw. One-shot, like _pop_cached_dry_run."""
+    cache = _read_json(_run_path("cache.json")) or {}
+    entry = cache.pop(str(device.id), None)
+    if entry is None:
+        return None
+    _write_json(_run_path("cache.json"), cache)
+    d = entry["result"]
+    if (
+        time.time() - entry["ts"] > _RUN_CACHE_TTL
+        or entry["auth_old"] != device.snmp_auth_profile
+        or d["previous_modules"] != sorted(device.current_modules)
+        or d["previous_modules_fast"] != sorted(device.current_modules_fast)
+    ):
+        return None
+    return ModulationResult(**{**d, "test_results": [ModuleTestResult(**t) for t in d["test_results"]]})
+
+
+def _probe_run_worker(run: dict, devices: dict) -> None:
+    """Probe run["devices"] one by one; a cancel drops the ones not started."""
+    dry_run = run["dry_run"]
+    save = lambda: _write_json(_run_path("run.json"), run)  # noqa: E731
+    try:
+        nb, snmp, engine, module_policy = _make_clients()
+        mod = Modulator(
+            nb, snmp, engine, dry_run=dry_run, module_policy=module_policy, device_parallelism=1,
+            honor_pins=True, liveness=_fetch_liveness_or_none(), liveness_key=_LIVENESS_KEY,
+        )
+        callbacks = _ServerCallbacks()
+        for entry in run["devices"]:
+            if entry["status"] != "queued":
+                continue
+            if os.path.exists(_run_path("cancel")):
+                entry["status"] = "cancelled"
+                save()
+                continue
+            device = devices[entry["device_id"]]
+            with _probe_semaphore:
+                entry["status"] = "running"
+                save()
+                start = time.time()
+                try:
+                    result = None if dry_run else _pop_run_cache(device)
+                    if result is not None:
+                        mod.commit(result)
+                        callbacks.netbox_update(action="changed" if result.changed else "unchanged")
+                        callbacks.device_processed("success")
+                        source = "cache"
+                    else:
+                        result = mod.run([device], callbacks=callbacks)[0]
+                        source = "probe"
+                    fields = _run_entry_result(result, source)
+                    if dry_run and fields["status"] == "ok":
+                        _store_run_cache(device, result)
+                except Exception as exc:
+                    logger.exception("probe/run failed for %s: %s", device.name, exc)
+                    fields = {"status": "error", "reason": str(exc)}
+            entry.update(duration_s=round(time.time() - start, 1), **fields)
+            save()
+    except Exception as exc:
+        logger.exception("probe/run aborted: %s", exc)
+        for entry in run["devices"]:
+            if entry["status"] in ("queued", "running"):
+                entry.update(status="error", reason=f"run aborted: {exc}")
+    finally:
+        was_cancelled = any(d["status"] == "cancelled" for d in run["devices"])
+        run.update(status="cancelled" if was_cancelled else "done", finished=_utc_now())
+        save()
+        _remove(_run_path("cancel"))
+        _remove(_run_path("run.lock"))
+        logger.info("probe/run %s%s: %d device(s)", run["status"], " [dry-run]" if dry_run else "", len(run["devices"]))
+
+
+def _start_run_worker(run: dict, devices: dict) -> None:
+    threading.Thread(target=_probe_run_worker, args=(run, devices), name="probe-run", daemon=True).start()
+
+
+def _probe_run_snapshot() -> dict:
+    run = _read_json(_run_path("run.json"))
+    if not run:
+        return {"status": "none", "max_devices": _RUN_MAX_DEVICES}
+    if run["status"] == "running" and not _run_lock_owner_alive():
+        run["status"] = "interrupted"
+    devices = run.pop("devices")
+    counts = {st: sum(1 for d in devices if d["status"] == st) for st in _RUN_FINAL}
+    done = sum(counts.values())
+    durations = [d["duration_s"] for d in devices if d.get("duration_s") is not None]
+    return {
+        **run, "max_devices": _RUN_MAX_DEVICES,
+        "total": len(devices), "done": done, "remaining": len(devices) - done,
+        "running": sum(1 for d in devices if d["status"] == "running"),
+        **counts,
+        "changed":   sum(1 for d in devices if d["status"] == "ok" and d["changed"]),
+        "unchanged": sum(1 for d in devices if d["status"] == "ok" and not d["changed"]),
+        "avg_duration_s": round(sum(durations) / len(durations), 1) if durations else None,
+        "devices": devices,
+    }
+
+
+@app.post(
+    "/probe/run",
+    status_code=202,
+    dependencies=[Depends(require_auth)],
+    summary="Probe the devices a NetBox filter selects, one after the other, with per-device results",
+)
+async def probe_run(
+    request: Request,
+    dry_run: Annotated[bool, Query(description="Report what would change without writing to NetBox")] = True,
+    limit: Annotated[Optional[int], Query(ge=1, description="Fewer devices than MODULATOR_RUN_MAX_DEVICES")] = None,
+) -> dict:
+    """
+    Start a bulk probe of every device the NetBox device filter in the query
+    selects (`?id=1&id=2`, `?site=dc1&role=switch`, …). Returns at once;
+    GET /probe/run shows the progress and each device's result, DELETE
+    /probe/run cancels the devices not started yet.
+
+    At most MODULATOR_RUN_MAX_DEVICES (20) per run: the first ones in NetBox's
+    order are queued, the rest is counted as over_limit. Pinned devices are
+    counted, listed as skipped and don't use up the limit. One run at a time
+    (409 while one is running), one device at a time.
+
+    Defaults to dry_run=true. A dry_run=false run commits a device's result
+    from the last dry run without probing again (source=cache) when that dry
+    run is at most MODULATOR_RUN_CACHE_TTL (1800s) old and the device's
+    modules and auth profile in NetBox are still the same; otherwise it
+    probes again (source=probe).
+    """
+    grouped = {k: v for k, v in _query_groups(request).items() if k not in _RUN_PARAMS}
+    nb_filter = {k: v[0] if len(v) == 1 else v for k, v in grouped.items()}
+    if not nb_filter:
+        raise HTTPException(status_code=400, detail="no devices selected: pass a NetBox device filter (id=…, site=…)")
+    bad = [k for k in nb_filter if not _VALID_FILTER_KEY.match(k)]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"invalid filter key(s) {bad!r}")
+    if _run_lock_owner_alive():
+        raise HTTPException(status_code=409, detail="run active")
+
+    def _select():
+        nb, _, engine, _ = _make_clients()
+        return nb.get_devices(**nb_filter), engine
+    try:
+        selected, engine = await asyncio.to_thread(_select)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"NetBox device filter failed: {exc}") from exc
+
+    fast = bool(engine.fast_module_field)
+    cap = min(limit, _RUN_MAX_DEVICES) if limit else _RUN_MAX_DEVICES
+    counts = {"selected": len(selected), "queued": 0, "over_limit": 0, "pinned": 0}
+    entries: list = []
+    for d in selected:
+        if _is_pinned(d, engine.pin_tag):
+            counts["pinned"] += 1
+            entries.append({**_run_entry(d, fast), "status": "skipped", "reason": "pinned", "changed": False})
+        elif counts["queued"] >= cap:
+            counts["over_limit"] += 1
+        else:
+            counts["queued"] += 1
+            entries.append(_run_entry(d, fast))
+    result = {"dry_run": dry_run, **counts, "max_devices": _RUN_MAX_DEVICES, "netbox_filter": nb_filter}
+    if not counts["queued"]:
+        return {"status": "none", **result}
+
+    if not _claim_run_lock():
+        raise HTTPException(status_code=409, detail="run active")
+    _remove(_run_path("cancel"))
+    run = {"status": "running", "dry_run": dry_run, "started": _utc_now(), "finished": None,
+           "netbox_filter": nb_filter, "devices": entries}
+    _write_json(_run_path("run.json"), run)
+    _start_run_worker(run, {d.id: d for d in selected})
+    logger.info("probe/run%s: %s (filter=%r)", " [dry-run]" if dry_run else "", counts, nb_filter)
+    return {"status": "running", **result}
+
+
+@app.get("/probe/run", dependencies=[Depends(require_auth)], summary="Progress and results of the bulk probe")
+async def probe_run_status() -> dict:
+    """
+    The running or last bulk probe (status none: none so far; interrupted:
+    the server restarted while it ran): totals, avg_duration_s of the finished
+    devices, and per device its status (queued, running, ok, skipped,
+    unreachable, error, cancelled), changed, old/new modules and auth profile,
+    reason, source (probe|cache) and duration_s.
+    """
+    return _probe_run_snapshot()
+
+
+@app.delete("/probe/run", dependencies=[Depends(require_auth)], summary="Cancel the bulk probe")
+async def probe_run_cancel() -> dict:
+    """Drop the devices not started yet. The one being probed finishes."""
+    if _run_lock_owner_alive():
+        with open(_run_path("cancel"), "w"):
+            pass
+        logger.warning("probe/run: cancel requested")
+    return _probe_run_snapshot()
+
+
 def _rules_html(snap: dict) -> str:
     """Render a MappingEngine.snapshot() dict as a dashboard-styled HTML page."""
     esc = lambda s: html.escape(str(s))  # noqa: E731
@@ -1334,6 +1657,8 @@ async def index() -> str:
   <tr><th>Method</th><th>Path</th><th>Description</th></tr>
   <tr><td>GET/POST</td><td>/probe</td><td>Probe a single device by IP or name</td></tr>
   <tr><td>GET/POST</td><td>/probe/netbox</td><td>Probe devices matching a NetBox filter</td></tr>
+  <tr><td>POST/GET/DELETE</td><td>/probe/run</td><td>Bulk probe, dry run, per-device results (max {_RUN_MAX_DEVICES});
+    GET for progress, DELETE to cancel</td></tr>
   <tr><td>GET/POST</td><td>/modules/add</td><td>Add module(s) on devices matching a NetBox filter — no probing</td></tr>
   <tr><td>GET/POST</td><td>/modules/remove</td><td>Remove module(s) — no probing</td></tr>
   <tr><td>GET/POST</td><td>/modules/replace</td><td>Replace module(s) with others — no probing</td></tr>

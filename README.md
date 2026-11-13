@@ -434,6 +434,8 @@ Tag changes are batched with the module write when modules changed — one API c
 | `MODULATOR_DRY_RUN` | `false` | Log changes without writing to NetBox |
 | `MODULATOR_DRY_RUN_CACHE_TTL` | `300` | Seconds a dry-run `/probe` result is remembered for; a plain (non-dry-run) `/probe` call for the *same* host within this window commits it for real without re-probing. `0` disables the cache |
 | `MODULATOR_EDIT_RESULT_TTL` | `86400` | Seconds a finished `/modules/add\|remove\|replace` job stays available via `GET /modules/result?job=<id>` |
+| `MODULATOR_RUN_MAX_DEVICES` | `20` | Devices per `POST /probe/run`; the rest is counted as `over_limit` |
+| `MODULATOR_RUN_CACHE_TTL` | `1800` | Seconds a `/probe/run` dry-run result can be committed by an apply without probing again |
 | `MODULATOR_PROBE_RESULT_TTL` | `300` | Seconds a finished probe result stays available via `GET /probe/result?host=X` before that endpoint 404s and a new probe must be submitted |
 | `MODULATOR_AUTH_TOKEN` | unset | Bearer token for `/probe` endpoints (disabled if unset) |
 | `MODULATOR_PORT` | `8080` | Server listen port |
@@ -482,6 +484,9 @@ Options:
 | `GET/POST /probe?host=<ip\|name>` | Probe a single device |
 | `GET /probe/result?host=<ip\|name>` | Poll a queued probe's progress or finished result |
 | `GET/POST /probe/netbox?<filter>` | Probe devices matching any NetBox filter |
+| `POST /probe/run?<filter>[&dry_run=false][&limit=n]` | Bulk probe with per-device results, see [Bulk probe run](#bulk-probe-run) |
+| `GET /probe/run` | Progress and results of the current or last bulk probe |
+| `DELETE /probe/run` | Cancel the devices of the bulk probe not started yet |
 | `GET/POST /modules/add?module=<m>&<filter>` | Add module(s) — no probing, see [Bulk module edits](#bulk-module-edits) |
 | `GET/POST /modules/remove?module=<m>[&<filter>]` | Remove module(s) — no probing |
 | `GET/POST /modules/replace?old=<m>&new=<m>[&<filter>]` | Replace module(s) — no probing |
@@ -521,6 +526,41 @@ is populated; everything else is null/empty until `status` flips to `"done"`.
 Keyed by `host`, same as `/probe` — no job id to track, just re-GET the same
 URL. `MODULATOR_PROBE_RESULT_TTL` (default 300s) controls how long a finished
 result stays available to poll for.
+
+### Bulk probe run
+
+`/probe/run` works like bit-discobox's `/rebuild/all`: a preview over a filter
+or a list of ids, then an apply of the chosen devices.
+
+```
+POST /probe/run?id=12&id=34            # dry_run=true is the default
+  -> 202 {"status": "running", "dry_run": true, "selected": 2, "queued": 2,
+          "over_limit": 0, "pinned": 0, "max_devices": 20, "netbox_filter": {...}}
+GET /probe/run
+  -> {"status": "running|done|cancelled|interrupted|none", "dry_run", "started", "finished",
+      "total", "done", "remaining", "running", "ok", "skipped", "unreachable", "error",
+      "cancelled", "changed", "unchanged", "avg_duration_s", "devices": [...]}
+POST /probe/run?id=12&dry_run=false    # apply
+DELETE /probe/run                      # cancel the devices not started yet
+```
+
+- One run at a time (409 `run active`), one device after the other, at most
+  `MODULATOR_RUN_MAX_DEVICES` per run in NetBox's order; the rest is counted as
+  `over_limit` and the caller sends the next batch.
+- Pinned devices are counted, listed as `skipped` with reason `pinned` and don't
+  use up the limit. A device the liveness gate reports down is `skipped` with
+  reason `offline` once its turn comes.
+- Each device: `device_id`, `device_name`, `host`, `status`
+  (`queued|running|ok|skipped|unreachable|error|cancelled`), `changed`, `reason`,
+  `source` (`probe|cache`), `duration_s`, `previous_modules`, `final_modules`,
+  `auth_profile_old`, `auth_profile_new`, plus `previous_modules_fast` and
+  `final_modules_fast` when the fast profile is configured.
+- An apply commits a device's result from the last dry run without probing
+  again (`source: cache`) if that dry run is at most `MODULATOR_RUN_CACHE_TTL`
+  old and the device's modules and auth profile in NetBox are unchanged;
+  otherwise it probes again (`source: probe`).
+- The state lives in files, so every worker answers the GET. After a restart
+  GET shows the last run; one that was still running shows `interrupted`.
 
 ### Bulk module edits
 
