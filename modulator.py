@@ -23,6 +23,9 @@ import yaml
 
 APP_NAME = "SNMPModulator"
 
+# Bumped when /rules or /rules/match change shape incompatibly (keys removed or renamed).
+SCHEMA_VERSION = 1
+
 logger = logging.getLogger(APP_NAME)
 
 MODULE_POLICIES   = ("use", "try", "drop")
@@ -416,37 +419,41 @@ class NetboxClient:
                 logger.warning("Device %r has no primary_ip4 — skipping", dev.name)
                 continue
 
-            primary_ip = dev.primary_ip4.address.split("/")[0]
-
-            cf = dev.custom_fields or {}
-            snmp_auth_profile = cf.get(self._auth_field) or ""
-
-            current_modules = self._flatten_multiselect(cf.get(self._module_field))
-            current_modules_fast = (
-                self._flatten_multiselect(cf.get(self._fast_module_field))
-                if self._fast_module_field else []
-            )
-
-            devices.append(DeviceInfo(
-                id=dev.id,
-                name=dev.name,
-                primary_ip=primary_ip,
-                snmp_auth_profile=snmp_auth_profile,
-                current_modules=current_modules,
-                polling_interval=cf.get(self._interval_field) or None,
-                polling_timeout=cf.get(self._timeout_field)   or None,
-                current_modules_fast=current_modules_fast,
-                polling_interval_fast=(
-                    (cf.get(self._fast_interval_field) or None) if self._fast_interval_field else None
-                ),
-                polling_timeout_fast=(
-                    (cf.get(self._fast_timeout_field) or None) if self._fast_timeout_field else None
-                ),
-                nb_device=dev,
-            ))
+            devices.append(self.device_info(dev))
 
         logger.info("Fetched %d eligible device(s) from NetBox", len(devices))
         return devices
+
+    def device_info(self, dev: Any) -> DeviceInfo:
+        """Build a DeviceInfo from a pynetbox device Record. primary_ip is "" when
+        the device has no primary_ip4 (get_devices skips those; callers that only
+        evaluate rules, like /rules/match, don't need an IP)."""
+        cf = dev.custom_fields or {}
+        return DeviceInfo(
+            id=dev.id,
+            name=dev.name,
+            primary_ip=dev.primary_ip4.address.split("/")[0] if dev.primary_ip4 else "",
+            snmp_auth_profile=cf.get(self._auth_field) or "",
+            current_modules=self._flatten_multiselect(cf.get(self._module_field)),
+            polling_interval=cf.get(self._interval_field) or None,
+            polling_timeout=cf.get(self._timeout_field)   or None,
+            current_modules_fast=(
+                self._flatten_multiselect(cf.get(self._fast_module_field))
+                if self._fast_module_field else []
+            ),
+            polling_interval_fast=(
+                (cf.get(self._fast_interval_field) or None) if self._fast_interval_field else None
+            ),
+            polling_timeout_fast=(
+                (cf.get(self._fast_timeout_field) or None) if self._fast_timeout_field else None
+            ),
+            nb_device=dev,
+        )
+
+    def get_device_by_id(self, device_id: int) -> Optional[DeviceInfo]:
+        """Single device by NetBox ID, no eligibility filter. None if it doesn't exist."""
+        dev = self.nb.dcim.devices.get(device_id)
+        return self.device_info(dev) if dev else None
 
     @staticmethod
     def _flatten_multiselect(raw: Any) -> list:
@@ -930,6 +937,7 @@ class MappingEngine:
         """JSON-serializable view of the loaded mapping — config, defaults, and
         rules (compiled regex patterns rendered back to their source strings)."""
         return {
+            "schema_version":  SCHEMA_VERSION,
             "module_field":    self.module_field,
             "auth_field":      self.auth_field,
             "interval_field":  self.interval_field,
@@ -1094,19 +1102,20 @@ class MappingEngine:
                 fast_timeout_floor = max(fast_timeout_floor, rule["fast_timeout"])
         return interval_floor, timeout_floor, fast_interval_floor, fast_timeout_floor
 
+    @staticmethod
+    def _match_field(pattern: re.Pattern, raw: Any) -> tuple:
+        """(matched, display) for one match key. List fields (e.g. tags) match if any
+        element's slug matches, falling back to str() for non-slug objects."""
+        if isinstance(raw, (list, tuple)):
+            values = [getattr(item, "slug", None) or str(item) for item in raw]
+            return any(pattern.fullmatch(v) for v in values), values
+        display = str(raw) if raw is not None else ""
+        return bool(pattern.fullmatch(display)), display
+
     def _match_rule(self, rule: dict, device: DeviceInfo) -> bool:
         """All patterns in compiled_match must match. Absent key = wildcard."""
         for field_path, pattern in rule["compiled_match"].items():
-            raw = _get_field(device.nb_device, field_path)
-            # List fields (e.g. tags): match if any element's slug matches,
-            # falling back to str() for non-slug objects.
-            if isinstance(raw, (list, tuple)):
-                values = [getattr(item, "slug", None) or str(item) for item in raw]
-                matched = any(pattern.fullmatch(v) for v in values)
-                display = values
-            else:
-                display = str(raw) if raw is not None else ""
-                matched = bool(pattern.fullmatch(display))
+            matched, display = self._match_field(pattern, _get_field(device.nb_device, field_path))
             logger.debug(
                 "  rule %-40s  %s  %-45s  pattern=%-30s  value=%r",
                 f"[{rule['name']}]",
@@ -1118,6 +1127,72 @@ class MappingEngine:
             if not matched:
                 return False
         return True
+
+    def explain(self, device: DeviceInfo, known_modules: list = (), known_auths: list = ()) -> dict:
+        """
+        Rule evaluation for one device without probing or writing — what a run
+        would start from. try sets stay unresolved ("would try"): which of them
+        end up in NetBox depends on the probe and module_policy.
+
+        matched_rules carries each matched rule's index into snapshot()["rules"]
+        plus the value every match key saw, so a UI can show why it matched.
+        """
+        unconditional, test, block, _, matched_rules = self.evaluate(device, known_modules)
+        fast_add, fast_test, fast_block = self.evaluate_fast(device, matched_rules, known_modules)
+        fixed_auth, auth_candidates, canary, auth_rule = self.evaluate_auth(device, known_auths)
+        interval, timeout, fast_interval, fast_timeout = self.resolve_polling_floors(matched_rules)
+        matched_ids = {id(r) for r in matched_rules}
+
+        snap = self.snapshot()
+        return {
+            "schema_version": snap["schema_version"],
+            "device": {"id": device.id, "name": device.name, "primary_ip": device.primary_ip or None},
+            "pinned": _is_pinned(device, self.pin_tag),
+            "pin_tag": self.pin_tag,
+            "module_policy": self.module_policy,
+            "defaults": snap["defaults"],
+            "matched_rules": [
+                {
+                    "index": i,
+                    "name": rule["name"],
+                    "match": [
+                        {"field": f, "pattern": p.pattern, "value": self._match_field(p, raw)[1]}
+                        for f, p in rule["compiled_match"].items()
+                        for raw in [_get_field(device.nb_device, f)]
+                    ],
+                }
+                for i, rule in enumerate(self._rules) if id(rule) in matched_ids
+            ],
+            "modules": {
+                "field": self.module_field,
+                "current": device.current_modules,
+                "add": sorted(unconditional), "try": sorted(test), "block": sorted(block),
+                "interval": _format_duration(interval), "timeout": _format_duration(timeout),
+                "current_interval": device.polling_interval, "current_timeout": device.polling_timeout,
+            },
+            "fast": {
+                "field": self.fast_module_field,
+                "current": device.current_modules_fast,
+                "add": sorted(fast_add), "try": sorted(fast_test), "block": sorted(fast_block),
+                "interval": _format_duration(fast_interval) if self.fast_module_field else None,
+                "timeout": _format_duration(fast_timeout) if self.fast_module_field else None,
+                "current_interval": device.polling_interval_fast,
+                "current_timeout": device.polling_timeout_fast,
+            },
+            "auth": {
+                "field": self.auth_field,
+                "current": device.snmp_auth_profile or None,
+                "policy": self.auth_policy,
+                "rule": auth_rule,
+                "use": fixed_auth,
+                "try": auth_candidates,
+                "probe_module": canary,
+            },
+            "handlers": {
+                "on_success": self.evaluate_handlers(matched_rules, success=True),
+                "on_fail": self.evaluate_handlers(matched_rules, success=False),
+            },
+        }
 
     @staticmethod
     def _parse_handlers(cfg: dict) -> dict:

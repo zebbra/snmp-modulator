@@ -97,6 +97,19 @@ def test_get_devices_skips_devices_without_primary_ip() -> None:
     assert [d.name for d in result] == ["sw1"]
 
 
+def test_get_device_by_id_returns_device_without_primary_ip() -> None:
+    devices = [FakeDevice(7, "sw-no-ip", custom_fields={"snmp_exporter_module": ["system"]})]
+    client = _client(devices)
+    client.nb.dcim.devices.get = lambda device_id: next((d for d in devices if d.id == device_id), None)
+
+    device = client.get_device_by_id(7)
+
+    assert device.name == "sw-no-ip"
+    assert device.primary_ip == ""
+    assert device.current_modules == ["system"]
+    assert client.get_device_by_id(8) is None
+
+
 # ── touch_field: written on real changes, left alone otherwise ────────────────
 
 class RecordingDevice:

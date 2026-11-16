@@ -607,6 +607,39 @@ def test_rules_surfaces_missing_mapping_file_as_500(monkeypatch) -> None:
     assert exc_info.value.status_code == 500
 
 
+def _patch_match_clients(monkeypatch, tmp_path, device):
+    mapping = tmp_path / "mapping.yaml"
+    mapping.write_text(_RULES_MAPPING)
+    engine = server.MappingEngine(str(mapping))
+    nb = SimpleNamespace(get_device_by_id=lambda device_id: device if device and device.id == device_id else None)
+    snmp = SimpleNamespace(modules=["cisco_generic", "if_full", "system"], auths=[])
+    monkeypatch.setattr(server, "_make_clients", lambda: (nb, snmp, engine, engine.module_policy))
+
+
+def test_rules_match_returns_evaluation_for_device(tmp_path, monkeypatch) -> None:
+    from modulator import DeviceInfo
+
+    nb_device = SimpleNamespace(device_type=SimpleNamespace(manufacturer=SimpleNamespace(slug="cisco")), tags=[])
+    device = DeviceInfo(id=5, name="sw5", primary_ip="10.0.0.5", snmp_auth_profile="",
+                        current_modules=[], nb_device=nb_device)
+    _patch_match_clients(monkeypatch, tmp_path, device)
+
+    result = asyncio.run(server.rules_match(device_id=5))
+
+    assert result["device"]["name"] == "sw5"
+    assert [r["name"] for r in result["matched_rules"]] == ["Cisco generic"]
+    assert result["modules"]["try"] == ["cisco_generic"]
+    assert result["version"] == server.__version__
+
+
+def test_rules_match_unknown_device_is_404(tmp_path, monkeypatch) -> None:
+    _patch_match_clients(monkeypatch, tmp_path, None)
+
+    with pytest.raises(server.HTTPException) as exc_info:
+        asyncio.run(server.rules_match(device_id=99))
+    assert exc_info.value.status_code == 404
+
+
 # ── /stats, /health, and the module-mismatch/devices-by-label helpers ──────────
 
 def test_module_mismatch_snapshot_uses_friendly_public_key_names() -> None:

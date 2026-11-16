@@ -579,3 +579,88 @@ def test_compare_module_sets_empty_when_either_side_missing() -> None:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ── explain(): rule evaluation for one device, no probe ─────────────────────────
+
+_EXPLAIN_MAPPING = """
+pin_tag: pin-snmp
+modules:
+  policy: drop
+  fast:
+    field: snmp_exporter_module_fast
+defaults:
+  modules:
+    try: [system, if_full]
+rules:
+  - name: "Cisco generic"
+    match:
+      device_type.manufacturer.slug: "cisco"
+    modules:
+      try: [cisco_generic, cisco_rf]
+  - name: "Juniper"
+    match:
+      device_type.manufacturer.slug: "juniper"
+    modules:
+      try: [juniper]
+  - name: "Standalone"
+    match:
+      device_type.manufacturer.slug: "cisco"
+      custom_fields.stack_members: "|0|1"
+    modules:
+      interval: 10m
+      block: [cisco_rf]
+      fast:
+        add: [if_updown_state]
+    auth:
+      try: [V3_A, V3_B]
+"""
+
+
+def _cisco_nb(stack_members=None, tags=()):
+    return SimpleNamespace(
+        device_type=SimpleNamespace(manufacturer=SimpleNamespace(slug="cisco")),
+        custom_fields={"stack_members": stack_members},
+        tags=[SimpleNamespace(slug=t) for t in tags],
+    )
+
+
+def test_explain_lists_matched_rules_with_index_and_values(tmp_path) -> None:
+    engine = _engine(tmp_path, _EXPLAIN_MAPPING)
+    result = engine.explain(_device(nb_device=_cisco_nb()))
+
+    assert [(r["index"], r["name"]) for r in result["matched_rules"]] == [(0, "Cisco generic"), (2, "Standalone")]
+    assert result["matched_rules"][1]["match"] == [
+        {"field": "device_type.manufacturer.slug", "pattern": "cisco", "value": "cisco"},
+        {"field": "custom_fields.stack_members", "pattern": "|0|1", "value": ""},
+    ]
+
+
+def test_explain_resolves_sets_without_probing(tmp_path) -> None:
+    engine = _engine(tmp_path, _EXPLAIN_MAPPING)
+    result = engine.explain(_device(nb_device=_cisco_nb(), current_modules=["system", "cisco_rf"]))
+
+    assert result["modules"]["try"] == ["cisco_generic", "if_full", "system"]
+    assert result["modules"]["block"] == ["cisco_rf"]
+    assert result["modules"]["current"] == ["system", "cisco_rf"]
+    assert result["modules"]["interval"] == "10m"
+    assert result["fast"]["add"] == ["if_updown_state"]
+    assert result["auth"]["rule"] == "Standalone"
+    assert result["auth"]["use"] is None
+    assert result["auth"]["try"] == ["V3_A", "V3_B"]
+    assert result["module_policy"] == "drop"
+    assert result["schema_version"] == 1
+
+
+def test_explain_stack_device_keeps_cisco_rf_and_reports_pin(tmp_path) -> None:
+    engine = _engine(tmp_path, _EXPLAIN_MAPPING)
+    result = engine.explain(_device(nb_device=_cisco_nb(stack_members=3, tags=["pin-snmp"])))
+
+    assert [r["name"] for r in result["matched_rules"]] == ["Cisco generic"]
+    assert "cisco_rf" in result["modules"]["try"]
+    assert result["pinned"] is True
+
+
+def test_snapshot_carries_schema_version(tmp_path) -> None:
+    engine = _engine(tmp_path, _EXPLAIN_MAPPING)
+    assert engine.snapshot()["schema_version"] == 1

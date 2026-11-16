@@ -15,6 +15,7 @@ Endpoints:
   DELETE   /probe/run                        Cancel the devices not started yet
   GET      /rules                            Loaded mapping.yaml rules/config as JSON
                                                (add ?format=html for a browsable page)
+  GET      /rules/match?device_id=<id>       Rules matching one device and their result, no probe
   GET      /stats                            Device counts by auth/module + module mismatch, as JSON
   GET      /metrics                          Prometheus metrics
   GET      /health                           Liveness check (includes module-mismatch counts)
@@ -1511,6 +1512,36 @@ async def rules(
     if format == "html":
         return HTMLResponse(_rules_html(snapshot))
     return snapshot
+
+
+@app.get(
+    "/rules/match",
+    dependencies=[Depends(require_auth)],
+    summary="Which rules match a device and what they resolve to, without probing",
+)
+async def rules_match(
+    device_id: Annotated[int, Query(description="NetBox device ID")],
+) -> dict:
+    """
+    Evaluates the current mapping file against one NetBox device the same way a
+    run does, but without probing or writing. try sets are what a run *would*
+    probe; which of them land in NetBox depends on the probe and module_policy.
+    404 if the device doesn't exist.
+    """
+    def _explain() -> Optional[dict]:
+        nb, snmp, engine, _ = _make_clients()
+        device = nb.get_device_by_id(device_id)
+        if device is None:
+            return None
+        return engine.explain(device, known_modules=snmp.modules, known_auths=snmp.auths)
+
+    try:
+        result = await asyncio.to_thread(_explain)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"rule evaluation failed: {exc}") from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"device {device_id} not found")
+    return {**result, "version": __version__}
 
 
 @app.get(_METRICS_PATH, include_in_schema=False)
